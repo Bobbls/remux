@@ -168,7 +168,9 @@ impl TryFrom<sdks::stremio::MediaType> for MediaKind {
     fn try_from(t: sdks::stremio::MediaType) -> Result<Self, Self::Error> {
         match t {
             sdks::stremio::MediaType::Movie => Ok(MediaKind::Movie),
-            sdks::stremio::MediaType::Series => Ok(MediaKind::Series),
+            sdks::stremio::MediaType::Series | sdks::stremio::MediaType::Anime => {
+                Ok(MediaKind::Series)
+            }
             sdks::stremio::MediaType::Tv | sdks::stremio::MediaType::Channel => {
                 Ok(MediaKind::TvChannel)
             }
@@ -908,6 +910,16 @@ impl ExternalIds {
             &source.series_custom_stremio_id,
             replace,
         );
+    }
+
+    pub fn has_anime_stremio_id(&self) -> bool {
+        self.custom_stremio_id
+            .as_deref()
+            .is_some_and(is_anime_stremio_id)
+            || self
+                .series_custom_stremio_id
+                .as_deref()
+                .is_some_and(is_anime_stremio_id)
     }
 }
 
@@ -1658,6 +1670,34 @@ impl Media {
         MediaImage::sync_from_media(db, self.id, &self.images)
             .await
             .ok();
+        let (item_ids, anime_ids) = system_anime_tag_ids(std::slice::from_ref(self));
+        if !item_ids.is_empty() {
+            let mut delete_qb = sqlx::QueryBuilder::new(
+                "DELETE FROM media_tags WHERE tag = 'system:anime' AND media_id IN (",
+            );
+            let mut delete_sep = delete_qb.separated(", ");
+            for id in &item_ids {
+                delete_sep.push_bind(id);
+            }
+            delete_qb.push(")");
+            delete_qb
+                .build()
+                .execute(db)
+                .await?;
+        }
+        if !anime_ids.is_empty() {
+            let mut insert_qb = sqlx::QueryBuilder::new(
+                "INSERT OR IGNORE INTO media_tags (media_id, tag) ",
+            );
+            insert_qb.push_values(anime_ids.iter(), |mut b, id| {
+                b.push_bind(id)
+                    .push_bind("system:anime");
+            });
+            insert_qb
+                .build()
+                .execute(db)
+                .await?;
+        }
 
         Ok(())
     }
@@ -1932,6 +1972,35 @@ impl Media {
                         .push_bind(img.height);
                 });
                 qb.build()
+                    .execute(&mut *tx)
+                    .await?;
+            }
+
+            let (item_ids, anime_ids) = system_anime_tag_ids(chunk);
+            if !item_ids.is_empty() {
+                let mut delete_qb = sqlx::QueryBuilder::new(
+                    "DELETE FROM media_tags WHERE tag = 'system:anime' AND media_id IN (",
+                );
+                let mut delete_sep = delete_qb.separated(", ");
+                for id in &item_ids {
+                    delete_sep.push_bind(id);
+                }
+                delete_qb.push(")");
+                delete_qb
+                    .build()
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            if !anime_ids.is_empty() {
+                let mut insert_qb = sqlx::QueryBuilder::new(
+                    "INSERT OR IGNORE INTO media_tags (media_id, tag) ",
+                );
+                insert_qb.push_values(anime_ids.iter(), |mut b, id| {
+                    b.push_bind(id)
+                        .push_bind("system:anime");
+                });
+                insert_qb
+                    .build()
                     .execute(&mut *tx)
                     .await?;
             }
@@ -4704,6 +4773,8 @@ impl TryFrom<sdks::stremio::Meta> for Media {
                     | sdks::stremio::Status::Planned => MediaStatus::Unreleased,
                     sdks::stremio::Status::Unknown => MediaStatus::Continuing,
                 });
+        let anime_tags =
+            stremio_anime_tags(&meta, &ExternalIds::from_stremio_id(&meta.id));
 
         let media = Media {
             title: meta
@@ -4791,6 +4862,7 @@ impl TryFrom<sdks::stremio::Meta> for Media {
         };
 
         let mut media = media;
+        media.tags = anime_tags;
         if let Some(url) = meta
             .poster
             .or(meta.thumbnail)
@@ -5382,6 +5454,50 @@ fn build_episode_relations_from_ep(
     relations
 }
 
+fn is_anime_stremio_id(id: &str) -> bool {
+    ["anilist:", "anidb:", "kitsu:", "mal:"]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+}
+
+fn stremio_anime_tags(meta: &sdks::stremio::Meta, ids: &ExternalIds) -> Vec<String> {
+    if matches!(meta.media_type, sdks::stremio::MediaType::Anime)
+        || meta
+            .genres
+            .as_ref()
+            .or(meta
+                .genre
+                .as_ref())
+            .is_some_and(|genres| {
+                genres
+                    .iter()
+                    .any(|genre| genre.eq_ignore_ascii_case("anime"))
+            })
+        || ids.has_anime_stremio_id()
+    {
+        vec!["system:anime".to_string()]
+    } else {
+        vec![]
+    }
+}
+
+fn system_anime_tag_ids(items: &[Media]) -> (Vec<Uuid>, Vec<Uuid>) {
+    let item_ids: Vec<Uuid> = items
+        .iter()
+        .map(|item| item.id)
+        .collect();
+    let anime_ids: Vec<Uuid> = items
+        .iter()
+        .filter(|item| {
+            item.tags
+                .iter()
+                .any(|tag| tag == "system:anime")
+        })
+        .map(|item| item.id)
+        .collect();
+    (item_ids, anime_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5454,6 +5570,216 @@ mod tests {
     fn from_path_no_brackets_is_empty() {
         let ids = ExternalIds::from_path("The.Matrix.1999.mkv");
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn from_stremio_id_preserves_anime_custom_ids() {
+        let anilist = ExternalIds::from_stremio_id("anilist:5114:1");
+        assert_eq!(
+            anilist
+                .custom_stremio_id
+                .as_deref(),
+            Some("anilist:5114:1")
+        );
+        assert!(anilist.has_anime_stremio_id());
+
+        let anidb = ExternalIds::from_stremio_id("anidb:807:12");
+        assert_eq!(
+            anidb
+                .custom_stremio_id
+                .as_deref(),
+            Some("anidb:807:12")
+        );
+        assert!(anidb.has_anime_stremio_id());
+
+        let kitsu = ExternalIds::from_stremio_id("kitsu:7442:5");
+        assert_eq!(
+            kitsu
+                .custom_stremio_id
+                .as_deref(),
+            Some("kitsu:7442:5")
+        );
+        assert!(kitsu.has_anime_stremio_id());
+
+        let mal = ExternalIds::from_stremio_id("mal:16498:3");
+        assert_eq!(
+            mal.custom_stremio_id
+                .as_deref(),
+            Some("mal:16498:3")
+        );
+        assert!(mal.has_anime_stremio_id());
+    }
+
+    #[test]
+    fn stremio_anime_type_sets_system_tag() {
+        let meta: sdks::stremio::Meta = serde_json::from_value(serde_json::json!({
+            "id": "tt0245429",
+            "imdb_id": "tt0245429",
+            "type": "anime",
+            "name": "Spirited Away"
+        }))
+        .expect("test meta should deserialize");
+
+        let media: Media = meta
+            .try_into()
+            .expect("anime meta should convert");
+        assert_eq!(media.kind, MediaKind::Series);
+        assert_eq!(media.tags, vec!["system:anime".to_string()]);
+    }
+
+    #[test]
+    fn anime_provider_id_sets_system_tag() {
+        let meta: sdks::stremio::Meta = serde_json::from_value(serde_json::json!({
+            "id": "anilist:5114:1",
+            "imdb_id": "tt0245429",
+            "type": "series",
+            "name": "Spirited Away"
+        }))
+        .expect("test meta should deserialize");
+
+        let media: Media = meta
+            .try_into()
+            .expect("anime provider ids should convert");
+        assert_eq!(
+            media
+                .external_ids
+                .custom_stremio_id
+                .as_deref(),
+            Some("anilist:5114:1")
+        );
+        assert_eq!(media.tags, vec!["system:anime".to_string()]);
+    }
+
+    #[test]
+    fn anime_genre_sets_system_tag_for_imdb_series() {
+        let meta: sdks::stremio::Meta = serde_json::from_value(serde_json::json!({
+            "id": "tt0409591",
+            "imdb_id": "tt0409591",
+            "type": "series",
+            "name": "Naruto",
+            "genres": ["Action", "Anime"]
+        }))
+        .expect("test meta should deserialize");
+
+        let media: Media = meta
+            .try_into()
+            .expect("anime genre should convert");
+        assert_eq!(
+            media
+                .external_ids
+                .imdb
+                .as_ref()
+                .map(|id| id.to_string()),
+            Some("tt0409591".to_string())
+        );
+        assert_eq!(media.tags, vec!["system:anime".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn upsert_persists_system_anime_tag_and_external_ids() {
+        let db = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .expect("in-memory db should connect");
+        crate::db::migrate(&db)
+            .await
+            .expect("migrations should run");
+
+        let meta: sdks::stremio::Meta = serde_json::from_value(serde_json::json!({
+            "id": "anilist:5114:1",
+            "imdb_id": "tt0245429",
+            "type": "anime",
+            "name": "Spirited Away"
+        }))
+        .expect("test meta should deserialize");
+
+        let media: Media = meta
+            .try_into()
+            .expect("anime meta should convert");
+        Media::upsert(&db, std::slice::from_ref(&media))
+            .await
+            .expect("media upsert should succeed");
+
+        let stored = Media::get_by_id(&db, &media.id)
+            .await
+            .expect("fetch should succeed")
+            .expect("media should exist");
+        assert_eq!(
+            stored
+                .external_ids
+                .custom_stremio_id
+                .as_deref(),
+            Some("anilist:5114:1")
+        );
+
+        let tags: Vec<String> = sqlx::query_scalar(
+            "SELECT tag FROM media_tags WHERE media_id = ? ORDER BY tag",
+        )
+        .bind(media.id)
+        .fetch_all(&db)
+        .await
+        .expect("tag query should succeed");
+        assert_eq!(tags, vec!["system:anime".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn smart_collection_tag_filter_returns_only_anime_items() {
+        let db = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .expect("in-memory db should connect");
+        crate::db::migrate(&db)
+            .await
+            .expect("migrations should run");
+
+        let anime_meta: sdks::stremio::Meta =
+            serde_json::from_value(serde_json::json!({
+                "id": "anilist:5114:1",
+                "imdb_id": "tt0245429",
+                "type": "anime",
+                "name": "Spirited Away"
+            }))
+            .expect("anime meta should deserialize");
+        let regular_meta: sdks::stremio::Meta =
+            serde_json::from_value(serde_json::json!({
+                "id": "tt0903747",
+                "imdb_id": "tt0903747",
+                "type": "series",
+                "name": "Breaking Bad"
+            }))
+            .expect("regular meta should deserialize");
+
+        let anime_media: Media = anime_meta
+            .try_into()
+            .expect("anime meta should convert");
+        let regular_media: Media = regular_meta
+            .try_into()
+            .expect("regular meta should convert");
+        Media::upsert(&db, &[anime_media.clone(), regular_media.clone()])
+            .await
+            .expect("media upsert should succeed");
+
+        let items = Media::get_by_filter(
+            &db,
+            &MediaFilter {
+                kind: Some(vec![MediaKind::Series]),
+                filter_rules: vec![remux_sdks::remux::FilterRule::Tag {
+                    op: remux_sdks::remux::SetOp::Is,
+                    values: vec!["system:anime".to_string()],
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("smart collection query should succeed");
+
+        assert_eq!(
+            items
+                .records
+                .len(),
+            1
+        );
+        assert_eq!(items.records[0].id, anime_media.id);
+        assert_eq!(items.records[0].title, anime_media.title);
+        assert_ne!(items.records[0].id, regular_media.id);
     }
 
     #[test]

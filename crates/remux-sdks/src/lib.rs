@@ -544,7 +544,9 @@ impl From<stremio::MediaType> for remux::MediaType {
     fn from(kind: stremio::MediaType) -> Self {
         match kind {
             stremio::MediaType::Movie => remux::MediaType::Movie,
-            stremio::MediaType::Series => remux::MediaType::Series,
+            stremio::MediaType::Series | stremio::MediaType::Anime => {
+                remux::MediaType::Series
+            }
             _ => remux::MediaType::Unknown,
         }
     }

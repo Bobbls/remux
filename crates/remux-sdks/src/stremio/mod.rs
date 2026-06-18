@@ -26,6 +26,7 @@ use uuid::Uuid;
 pub enum MediaType {
     Movie,
     Series,
+    Anime,
     Tv,
     Channel,
     Events,
@@ -651,7 +652,7 @@ fn parse_duration_lossy(input: &str) -> Result<std::time::Duration, String> {
 
 impl Meta {
     pub fn is_series(&self) -> bool {
-        self.media_type == MediaType::Series
+        matches!(self.media_type, MediaType::Series | MediaType::Anime)
     }
 
     pub fn get_season_numbers(&self) -> Vec<i64> {

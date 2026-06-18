@@ -254,6 +254,18 @@ pub(crate) fn merge_media(target: &mut db::Media, source: &db::Media, replace: b
     {
         merge_option(&mut target.rating_audience, &source.rating_audience, true);
     }
+
+    merge_system_tag(&mut target.tags, &source.tags, "system:anime");
+}
+
+fn merge_system_tag(target: &mut Vec<String>, source: &[String], system_tag: &str) {
+    target.retain(|tag| tag != system_tag);
+    if source
+        .iter()
+        .any(|tag| tag == system_tag)
+    {
+        target.push(system_tag.to_string());
+    }
 }
 
 pub(crate) fn apply_title_format(media: &mut db::Media) {
@@ -1872,4 +1884,41 @@ impl RemoteMediaStream for AddonCatalogStream {
 
 pub fn make_media_id(addon_id: Uuid, local_id: &str) -> String {
     format!("addon:{addon_id}:{local_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_media_adds_system_anime_without_clobbering_user_tags() {
+        let mut target = db::Media {
+            tags: vec!["favorite".to_string()],
+            ..Default::default()
+        };
+        let source = db::Media {
+            tags: vec!["system:anime".to_string()],
+            ..Default::default()
+        };
+
+        merge_media(&mut target, &source, false);
+
+        assert_eq!(
+            target.tags,
+            vec!["favorite".to_string(), "system:anime".to_string()]
+        );
+    }
+
+    #[test]
+    fn merge_media_clears_stale_system_anime_when_patch_is_not_anime() {
+        let mut target = db::Media {
+            tags: vec!["favorite".to_string(), "system:anime".to_string()],
+            ..Default::default()
+        };
+        let source = db::Media::default();
+
+        merge_media(&mut target, &source, false);
+
+        assert_eq!(target.tags, vec!["favorite".to_string()]);
+    }
 }

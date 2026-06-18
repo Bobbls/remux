@@ -547,7 +547,10 @@ pub(crate) async fn resolve_imdb_id<A: sdks::Auth + Clone>(
         }
         if let Some(client) = tmdb_client {
             if !ids.is_empty() {
-                let is_tv = meta.media_type == sdks::stremio::MediaType::Series;
+                let is_tv = matches!(
+                    meta.media_type,
+                    sdks::stremio::MediaType::Series | sdks::stremio::MediaType::Anime
+                );
                 meta.imdb_id =
                     crate::addons::tmdb::resolve_imdb_from_ids(&ids, is_tv, client)
                         .await
