@@ -1267,6 +1267,17 @@ impl AddonService {
                 match db::Media::upsert(&ctx.db, &items).await {
                     Ok(_) => {
                         save_pending_relations(ctx, &items).await;
+                        let series_ids: Vec<_> = items
+                            .iter()
+                            .filter(|item| item.kind == db::MediaKind::Series)
+                            .map(|item| item.id)
+                            .collect();
+                        if let Err(e) =
+                            db::Media::reconcile_series_identities(&ctx.db, &series_ids)
+                                .await
+                        {
+                            warn!(error = %e, "failed to reconcile series identities");
+                        }
                     }
                     Err(e) => {
                         error!(error = %e, "failed to upsert media batch");
@@ -1279,6 +1290,17 @@ impl AddonService {
             match db::Media::upsert(&ctx.db, &batch).await {
                 Ok(_) => {
                     save_pending_relations(ctx, &batch).await;
+                    let series_ids: Vec<_> = batch
+                        .iter()
+                        .filter(|item| item.kind == db::MediaKind::Series)
+                        .map(|item| item.id)
+                        .collect();
+                    if let Err(e) =
+                        db::Media::reconcile_series_identities(&ctx.db, &series_ids)
+                            .await
+                    {
+                        warn!(error = %e, "failed to reconcile series identities");
+                    }
                 }
                 Err(e) => {
                     error!(error = %e, "failed to upsert final media batch");
