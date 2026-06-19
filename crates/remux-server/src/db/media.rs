@@ -1,7 +1,10 @@
-use super::{FilterResult, ImageKind, MediaImage, MediaImages, QueryBuilderExt};
+use super::{
+    FilterResult, ImageKind, MediaImage, MediaImages, QueryBuilderExt,
+    SQLITE_BIND_LIMIT,
+};
 
 pub const CHUNK_SIZE: usize = 500;
-const SQLITE_VAR_LIMIT: usize = 999;
+const SQLITE_VAR_LIMIT: usize = SQLITE_BIND_LIMIT;
 
 static DB_WRITE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
@@ -2414,12 +2417,7 @@ impl Media {
                         if ids.is_empty() {
                             qb.push(" AND 1=0");
                         } else {
-                            qb.push(" AND media.id IN (");
-                            let mut sep = qb.separated(", ");
-                            for id in ids {
-                                sep.push_bind(*id);
-                            }
-                            qb.push(")");
+                            qb.push_in("media.id", ids);
                         }
                     }
                 }
