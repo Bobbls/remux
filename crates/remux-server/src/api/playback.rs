@@ -1850,6 +1850,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_sessions_does_not_borrow_sibling_streams_for_selected_unprobed_source() {
+        use crate::{
+            api::{MediaSourceInfo, MediaStream, MediaStreamType},
+            db,
+        };
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let now = chrono::Utc::now().naive_utc();
+
+        let external_ids = db::ExternalIds {
+            imdb: db::NonEmptyString::try_new("tt1234567".to_string()).ok(),
+            ..Default::default()
+        };
+
+        let mut movie = db::Media {
+            title: "Sibling Probe Borrow Test".to_string(),
+            kind: db::MediaKind::Movie,
+            external_ids: external_ids.clone(),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        movie.id = uuid::Uuid::from(&crate::db::MediaIdRaw {
+            kind: db::MediaKind::Movie,
+            external_ids,
+            season: None,
+            episode: None,
+        });
+        movie
+            .save(&guard.0.db)
+            .await
+            .expect("save movie");
+
+        let mut probed_source = db::Media {
+            title: "Probed source".to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(movie.id),
+            probe_data: Some(MediaSourceInfo {
+                container: Some("mkv".to_string()),
+                media_streams: vec![
+                    MediaStream {
+                        codec: Some("h264".to_string()),
+                        type_: Some(MediaStreamType::Video),
+                        index: 0,
+                        ..Default::default()
+                    },
+                    MediaStream {
+                        codec: Some("aac".to_string()),
+                        type_: Some(MediaStreamType::Audio),
+                        index: 1,
+                        language: Some("en".to_string()),
+                        ..Default::default()
+                    },
+                    MediaStream {
+                        codec: Some("srt".to_string()),
+                        type_: Some(MediaStreamType::Subtitle),
+                        index: 2,
+                        language: Some("es".to_string()),
+                        title: Some("Sibling subtitle".to_string()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        probed_source
+            .save(&guard.0.db)
+            .await
+            .expect("save probed source");
+
+        let mut selected_unprobed_source = db::Media {
+            title: "Selected unprobed source".to_string(),
+            kind: db::MediaKind::Stream,
+            parent_id: Some(movie.id),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        selected_unprobed_source
+            .save(&guard.0.db)
+            .await
+            .expect("save unprobed source");
+
+        server
+            .post("/sessions/playing")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "ItemId": movie.id,
+                "MediaSourceId": selected_unprobed_source.id,
+                "PlaySessionId": "test-session-unprobed-source",
+                "PositionTicks": 0
+            }))
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+
+        let resp = server
+            .get("/sessions")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        resp.assert_status_ok();
+        let sessions: Vec<crate::api::SessionInfoDto> = resp.json();
+        let streams = sessions[0]
+            .now_playing_item
+            .as_ref()
+            .and_then(|item| item.media_streams.as_ref());
+
+        assert!(
+            streams.is_none(),
+            "selected unprobed source should not inherit sibling streams: {streams:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_get_sessions_refreshes_device_metadata_from_auth_header() {
         let (server, _ctx, token) = authenticated_server().await;
         let auth = format!(
