@@ -1,10 +1,17 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use super::{Status, default_append_to_response};
 use crate::Endpoint;
 
 use chrono::NaiveDate;
-use serde_with::serde_as;
+use serde_with::{serde_as, skip_serializing_none};
+
+fn serialize_comma<S>(v: &[String], s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_str(&v.join(","))
+}
 
 #[serde_as]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -25,10 +32,13 @@ pub struct Movie {
     pub imdb_id: Option<String>,
     pub original_language: String,
     pub genres: Option<Vec<super::Genre>>,
+    pub production_companies: Option<Vec<super::ProductionCompany>>,
+    pub production_countries: Option<Vec<super::ProductionCountry>>,
     pub external_ids: Option<super::ExternalIds>,
     pub credits: Option<super::Credits>,
     pub images: Option<super::Images>,
     pub release_dates: Option<MovieReleaseDates>,
+    pub popularity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -50,14 +60,16 @@ pub struct MovieReleaseDate {
     pub release_type: u8,
 }
 
+#[skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovieEndpoint {
+    #[serde(skip)]
     pub id: i64,
-
-    // #[builder(default = "en")]
     pub language: Option<String>,
-
-    // #[builder(default = default_append_to_response())]
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        serialize_with = "serialize_comma"
+    )]
     pub append_to_response: Vec<String>,
 }
 
@@ -78,22 +90,8 @@ impl Endpoint for MovieEndpoint {
         format!("movie/{}", self.id)
     }
 
-    fn query(&self) -> Vec<(String, String)> {
-        let mut params = vec![];
-        if let Some(lang) = &self.language {
-            params.push(("language".to_string(), lang.clone()));
-        }
-        if !self
-            .append_to_response
-            .is_empty()
-        {
-            params.push((
-                "append_to_response".to_string(),
-                self.append_to_response
-                    .join(","),
-            ));
-        }
-        params
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        self
     }
 }
 
@@ -104,6 +102,7 @@ pub struct MovieSearchResult {
     #[serde(default, deserialize_with = "crate::deserialize_option_naive_date")]
     pub release_date: Option<NaiveDate>,
     pub poster_path: Option<String>,
+    pub popularity: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -124,15 +123,7 @@ impl Endpoint for SearchMovieEndpoint {
         "search/movie".to_string()
     }
 
-    fn query(&self) -> Vec<(String, String)> {
-        let mut params = vec![(
-            "query".to_string(),
-            self.query
-                .clone(),
-        )];
-        if let Some(y) = self.year {
-            params.push(("year".to_string(), y.to_string()));
-        }
-        params
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        self
     }
 }

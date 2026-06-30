@@ -12,6 +12,186 @@ pub trait DeviceProfileExt {
     fn check_direct_play(&self, media_source: &MediaSourceInfo) -> TranscodeReasons;
 }
 
+#[derive(
+    Debug, Clone, PartialEq, Eq, strum_macros::EnumString, strum_macros::Display,
+)]
+#[strum(ascii_case_insensitive)]
+pub(crate) enum SubtitleCodec {
+    // Canonical: "pgssub". Aliases: pgs, hdmv_pgs_subtitle, sup.
+    #[strum(
+        to_string = "pgssub",
+        serialize = "pgssub",
+        serialize = "pgs",
+        serialize = "hdmv_pgs_subtitle",
+        serialize = "sup"
+    )]
+    Pgs,
+    // Canonical: "srt". Aliases: subrip.
+    #[strum(to_string = "srt", serialize = "srt", serialize = "subrip")]
+    Srt,
+    // Canonical: "dvdsub". Aliases: dvd_subtitle.
+    #[strum(to_string = "dvdsub", serialize = "dvdsub", serialize = "dvd_subtitle")]
+    DvdSub,
+    // Canonical: "dvbsub". Aliases: dvb_subtitle.
+    #[strum(to_string = "dvbsub", serialize = "dvbsub", serialize = "dvb_subtitle")]
+    DvbSub,
+    // Canonical: "ass". Aliases: ssa.
+    #[strum(to_string = "ass", serialize = "ass", serialize = "ssa")]
+    Ass,
+    // Canonical: "vtt". Aliases: webvtt.
+    #[strum(to_string = "vtt", serialize = "vtt", serialize = "webvtt")]
+    WebVtt,
+    // Canonical: "tx3g". Aliases: mov_text.
+    #[strum(to_string = "tx3g", serialize = "tx3g", serialize = "mov_text")]
+    MovText,
+}
+
+impl SubtitleCodec {
+    pub(crate) fn is_image(&self) -> bool {
+        matches!(self, Self::Pgs | Self::DvdSub | Self::DvbSub)
+    }
+
+    pub(crate) fn is_text(&self) -> bool {
+        !self.is_image()
+    }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, strum_macros::EnumString, strum_macros::Display,
+)]
+#[strum(ascii_case_insensitive)]
+pub(crate) enum VideoCodec {
+    #[strum(
+        to_string = "h264",
+        serialize = "h264",
+        serialize = "avc",
+        serialize = "avc1"
+    )]
+    H264,
+    #[strum(
+        to_string = "hevc",
+        serialize = "hevc",
+        serialize = "h265",
+        serialize = "hvc1",
+        serialize = "hev1"
+    )]
+    Hevc,
+    #[strum(
+        to_string = "av1",
+        serialize = "av1",
+        serialize = "libaom-av1",
+        serialize = "libsvtav1"
+    )]
+    Av1,
+    #[strum(to_string = "vp9", serialize = "vp9", serialize = "libvpx-vp9")]
+    Vp9,
+    #[strum(to_string = "vp8", serialize = "vp8", serialize = "libvpx")]
+    Vp8,
+    #[strum(to_string = "mpeg4", serialize = "mpeg4")]
+    Mpeg4,
+    #[strum(
+        to_string = "mpeg2video",
+        serialize = "mpeg2video",
+        serialize = "mpeg2"
+    )]
+    Mpeg2,
+    #[strum(default)]
+    Unknown(String),
+}
+
+impl VideoCodec {
+    pub(crate) fn is_hevc(&self) -> bool {
+        matches!(self, Self::Hevc)
+    }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, strum_macros::EnumString, strum_macros::Display,
+)]
+#[strum(ascii_case_insensitive)]
+pub(crate) enum AudioCodec {
+    #[strum(
+        to_string = "aac",
+        serialize = "aac",
+        serialize = "aac_fixed",
+        serialize = "aac_latm"
+    )]
+    Aac,
+    #[strum(to_string = "ac3", serialize = "ac3", serialize = "a52")]
+    Ac3,
+    #[strum(to_string = "eac3", serialize = "eac3", serialize = "ec3")]
+    Eac3,
+    #[strum(to_string = "truehd", serialize = "truehd")]
+    TrueHd,
+    #[strum(to_string = "dts", serialize = "dts", serialize = "dca")]
+    Dts,
+    #[strum(to_string = "flac", serialize = "flac")]
+    Flac,
+    #[strum(to_string = "mp3", serialize = "mp3", serialize = "mp3float")]
+    Mp3,
+    #[strum(to_string = "opus", serialize = "opus", serialize = "libopus")]
+    Opus,
+    #[strum(to_string = "vorbis", serialize = "vorbis")]
+    Vorbis,
+    #[strum(to_string = "alac", serialize = "alac")]
+    Alac,
+    #[strum(
+        to_string = "pcm",
+        serialize = "pcm",
+        serialize = "pcm_s16le",
+        serialize = "pcm_s24le",
+        serialize = "pcm_s32le",
+        serialize = "pcm_f32le",
+        serialize = "pcm_s16be",
+        serialize = "pcm_u8"
+    )]
+    Pcm,
+    #[strum(default)]
+    Unknown(String),
+}
+
+impl AudioCodec {
+    pub(crate) fn friendly_name(&self) -> &str {
+        match self {
+            Self::Aac => "AAC",
+            Self::Ac3 => "Dolby Digital",
+            Self::Eac3 => "Dolby Digital Plus",
+            Self::TrueHd => "TrueHD",
+            Self::Dts => "DTS",
+            Self::Flac => "FLAC",
+            Self::Mp3 => "MP3",
+            Self::Opus => "Opus",
+            Self::Vorbis => "Vorbis",
+            Self::Alac => "ALAC",
+            Self::Pcm => "PCM",
+            Self::Unknown(s) => s.as_str(),
+        }
+    }
+
+    pub(crate) fn needs_adts_reframe(&self) -> bool {
+        matches!(self, Self::Aac)
+    }
+}
+
+pub(crate) fn subtitle_codec_matches_profile(
+    codec: &str,
+    profile_format: &str,
+) -> bool {
+    match (
+        codec
+            .trim()
+            .parse::<SubtitleCodec>(),
+        profile_format
+            .trim()
+            .parse::<SubtitleCodec>(),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => codec
+            .trim()
+            .eq_ignore_ascii_case(profile_format.trim()),
+    }
+}
+
 impl DeviceProfileExt for DeviceProfile {
     fn video_transcoding_profile(&self) -> Option<&TranscodingProfile> {
         let is_video = |p: &&TranscodingProfile| {
@@ -55,7 +235,7 @@ impl DeviceProfileExt for DeviceProfile {
             .find(|p| {
                 p.format
                     .as_deref()
-                    .map(|f| f.eq_ignore_ascii_case(codec))
+                    .map(|f| subtitle_codec_matches_profile(codec, f))
                     .unwrap_or(false)
             })
             .and_then(|p| {
@@ -194,7 +374,7 @@ fn check_subtitle_codec(
             let format_matches = p
                 .format
                 .as_deref()
-                .map(|f| f.eq_ignore_ascii_case(sub_codec))
+                .map(|f| subtitle_codec_matches_profile(sub_codec, f))
                 .unwrap_or(false);
             if !format_matches {
                 return false;
@@ -517,5 +697,80 @@ impl ProfileConditionExt for ProfileCondition {
             }
             _ => true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceProfileExt;
+    use remux_sdks::remux::{
+        DeviceProfile, DirectPlayProfile, MediaSourceInfo, MediaStream,
+        MediaStreamType, SubtitleDeliveryMethod, SubtitleProfile, TranscodeReason,
+    };
+
+    #[test]
+    fn subtitle_delivery_method_accepts_pgs_aliases() {
+        let profile = DeviceProfile {
+            subtitle_profiles: vec![SubtitleProfile {
+                format: Some("pgs".to_string()),
+                method: Some(SubtitleDeliveryMethod::External),
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            profile.subtitle_delivery_method("hdmv_pgs_subtitle"),
+            Some(SubtitleDeliveryMethod::External)
+        );
+    }
+
+    #[test]
+    fn direct_play_does_not_reject_aliased_subtitle_codecs() {
+        let profile = DeviceProfile {
+            direct_play_profiles: vec![DirectPlayProfile {
+                container: Some("mkv".to_string()),
+                video_codec: Some("h264".to_string()),
+                audio_codec: Some("aac".to_string()),
+                type_: Some("Video".to_string()),
+            }],
+            subtitle_profiles: vec![SubtitleProfile {
+                format: Some("pgs".to_string()),
+                method: Some(SubtitleDeliveryMethod::Embed),
+            }],
+            ..Default::default()
+        };
+        let media_source = MediaSourceInfo {
+            container: Some("mkv".to_string()),
+            default_subtitle_stream_index: Some(2),
+            media_streams: vec![
+                MediaStream {
+                    codec: Some("h264".to_string()),
+                    type_: Some(MediaStreamType::Video),
+                    index: 0,
+                    ..Default::default()
+                },
+                MediaStream {
+                    codec: Some("aac".to_string()),
+                    type_: Some(MediaStreamType::Audio),
+                    index: 1,
+                    ..Default::default()
+                },
+                MediaStream {
+                    codec: Some("hdmv_pgs_subtitle".to_string()),
+                    type_: Some(MediaStreamType::Subtitle),
+                    index: 2,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let reasons = profile.check_direct_play(&media_source);
+        assert!(
+            !reasons.contains(&TranscodeReason::SubtitleCodecNotSupported(
+                "hdmv_pgs_subtitle".to_string()
+            )),
+            "alias-matched subtitle should remain direct-play eligible: {reasons:?}"
+        );
     }
 }

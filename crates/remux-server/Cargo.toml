@@ -13,6 +13,14 @@ path = "src/lib.rs"
 name = "remux-server"
 path = "src/main.rs"
 
+[[bench]]
+name = "shows"
+harness = false
+
+[[bench]]
+name = "items"
+harness = false
+
 [dependencies]
 # 12 needed for milldeware compatibility
 reqwest = { version = "0.13", default-features = false, features = [
@@ -92,7 +100,7 @@ serde_alias = "0.0.2"
 axum-anyhow = "0.10.3"
 moka = { version = "0.12.12", features = ["sync"] }
 #reqwest-tracing = "0.5.8"
-#serde_urlencoded = "0.7.1"
+serde_urlencoded = "0.7.1"
 config = "0.15.19"
 serde-aux = "4.7.0"
 sqlx = { version = "0.8", features = [ "runtime-tokio", "sqlite", "uuid", "chrono", "json" ] }
@@ -127,3 +135,6 @@ desktop = ["include_dir"]
 
 [dev-dependencies]
 axum-test = "18.7.0"
+codspeed-divan-compat = "4"
+chrono = { version = "0.4", features = ["serde"] }
+httpmock = "0.7"

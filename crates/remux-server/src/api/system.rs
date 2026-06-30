@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use http::StatusCode;
-use remux_macros::{api_query, get, post, route};
+use remux_macros::{get, post, query, route};
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -16,9 +16,11 @@ use crate::{
     AppState, IntoApiError, OptionExt, ResultExt, api,
     common::{self, get_uuid, server_id},
     db::{self, auth},
+    intro,
 };
 use anyhow;
 use axum_anyhow::ApiResult as Result;
+use remux_sdks::remux::IntroOptions;
 
 use super::mock_items;
 
@@ -241,6 +243,46 @@ pub async fn update_encoding_configuration(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Get intro configuration
+#[get("/system/configuration/intro")]
+pub async fn get_intro_configuration(
+    State(state): State<AppState>,
+    _session: auth::AdminSession,
+) -> axum_anyhow::ApiResult<impl IntoResponse> {
+    let opts = db::Settings::get_intro_config(
+        &state
+            .ctx
+            .db,
+    )
+    .await?;
+    Ok(Json(opts))
+}
+
+/// Update intro configuration
+#[post("/system/configuration/intro")]
+pub async fn update_intro_configuration(
+    State(state): State<AppState>,
+    _session: auth::AdminSession,
+    Json(opts): Json<IntroOptions>,
+) -> axum_anyhow::ApiResult<impl IntoResponse> {
+    db::Settings::set_intro_config(
+        &state
+            .ctx
+            .db,
+        &opts,
+    )
+    .await?;
+    let ctx = state
+        .ctx
+        .clone();
+    tokio::spawn(async move {
+        if let Err(e) = intro::sync_intros(&ctx).await {
+            tracing::warn!(err = ?e, "intro sync failed after config update");
+        }
+    });
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[get("/system/endpoint")]
 pub async fn system_endpoint(
     State(state): State<AppState>,
@@ -362,12 +404,12 @@ pub async fn quickconnect_initiate(
     }))
 }
 
-#[api_query]
+#[query]
 pub struct QuickConnectSecretQuery {
     pub secret: String,
 }
 
-#[api_query]
+#[query]
 pub struct QuickConnectCodeQuery {
     pub code: String,
 }

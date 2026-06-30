@@ -1,3 +1,104 @@
+## [0.10.2](https://github.com/lostb1t/remux/compare/v0.10.1...v0.10.2) (2026-06-24)
+
+
+### Bug Fixes
+
+* **web:** fix stream loading flicker on playback ([e0e4cc0](https://github.com/lostb1t/remux/commit/e0e4cc06b55ab658562cab67b5fe8ed822701e22))
+* **web:** race conditions in async stream handling ([5fd3f2f](https://github.com/lostb1t/remux/commit/5fd3f2ff6f1d79f1032b6671031a4ddf0497a1bc))
+
+## [0.10.1](https://github.com/lostb1t/remux/compare/v0.10.0...v0.10.1) (2026-06-24)
+
+
+### Bug Fixes
+
+* **hls:** use EXT-X-START for resumed TS-HLS instead of ffmpeg playlist ([#51](https://github.com/lostb1t/remux/issues/51)) ([8ca8fd3](https://github.com/lostb1t/remux/commit/8ca8fd33150d82711b0e7a723117902ad8633165))
+
+
+### Performance Improvements
+
+* load streams async on item details page for web ([#47](https://github.com/lostb1t/remux/issues/47)) ([9fcbd8d](https://github.com/lostb1t/remux/commit/9fcbd8d69fb45d727f368c7493fe46e0d9374acc))
+
+# [0.10.0](https://github.com/lostb1t/remux/compare/v0.9.0...v0.10.0) (2026-06-23)
+
+
+### Bug Fixes
+
+* apply release filter to nextup ([#35](https://github.com/lostb1t/remux/issues/35)) ([#38](https://github.com/lostb1t/remux/issues/38)) ([78472b3](https://github.com/lostb1t/remux/commit/78472b33ab47374035940ef08cd89d42638ec586))
+* hide recent theatrical-only movies until digital release confirmed ([e4f7eb1](https://github.com/lostb1t/remux/commit/e4f7eb1bbf414fe112af21dae0285c453ce8d698))
+* **hls:** serve ffmpeg playlist for resumed ts-hls ([#43](https://github.com/lostb1t/remux/issues/43)) ([66c1ed1](https://github.com/lostb1t/remux/commit/66c1ed14e41b5b2e52fb99fb35ca1e64245f010b))
+* **images:** proxy external image URLs instead of redirecting ([6076c56](https://github.com/lostb1t/remux/commit/6076c56e64e9527c818ec65309037722465f3504))
+* override collection sort when SortName appears anywhere in sort list ([c1231d4](https://github.com/lostb1t/remux/commit/c1231d42790d345d141bc498d37e82af6e4d0788))
+* prevent squash migration from re-running on every restart ([#36](https://github.com/lostb1t/remux/issues/36)) ([7c80a12](https://github.com/lostb1t/remux/commit/7c80a124c592bd5c1dc7de5585beeb8d464f06b2))
+* return empty when includeItemTypes doesn't match collection content type ([a7f0d5b](https://github.com/lostb1t/remux/commit/a7f0d5b9e550c646b5ac069758f3d463a5fa6830))
+
+
+### Features
+
+* intro support ([#32](https://github.com/lostb1t/remux/issues/32)) ([#39](https://github.com/lostb1t/remux/issues/39)) ([ba23b31](https://github.com/lostb1t/remux/commit/ba23b310be9719d3f9c941e81f3e25137ad9ac28))
+
+
+### Performance Improvements
+
+* **images:** use sized TMDB image variants and populate ImageTags.Thumb ([9f6c4a5](https://github.com/lostb1t/remux/commit/9f6c4a540c9e23be011125291a6edb7fd33e0c11))
+
+# [0.9.0](https://github.com/lostb1t/remux/compare/v0.8.0...v0.9.0) (2026-06-21)
+
+
+### Bug Fixes
+
+* external subtitles for web ([aa335f1](https://github.com/lostb1t/remux/commit/aa335f10fa4817e827620fb847d76f2f18e0b904))
+* force nextup active-series join order ([#26](https://github.com/lostb1t/remux/issues/26)) ([fefccdf](https://github.com/lostb1t/remux/commit/fefccdf7f6608513a47f44032eb42322a8e00c9c))
+* handle progress reports without play session id ([#29](https://github.com/lostb1t/remux/issues/29)) ([5833a3f](https://github.com/lostb1t/remux/commit/5833a3f6679b7d0863cae8f57beea819fcb14539))
+* inherit runtime from ([a7a53cb](https://github.com/lostb1t/remux/commit/a7a53cbf6b1ba401bf24b1f5b32d754f4eb3fa07))
+* nextup was missing imported nedia [#14](https://github.com/lostb1t/remux/issues/14) ([5ec7471](https://github.com/lostb1t/remux/commit/5ec7471655db82523d1c37e1203423a6f23cd971))
+* optimize iptv purge ([4c64a89](https://github.com/lostb1t/remux/commit/4c64a89d4ed50020252855585d79d2ab3999057e))
+* order continue watching by play date ([#19](https://github.com/lostb1t/remux/issues/19)) ([17ac545](https://github.com/lostb1t/remux/commit/17ac5454fcb714df12a61b81819a8aef9e5d61a9))
+* pass --repo to gh release create to avoid missing git context ([99ad721](https://github.com/lostb1t/remux/commit/99ad721477228dbec84a45c8f75c83f9109632e5))
+* persist probe data between stream refresh ([f4212dd](https://github.com/lostb1t/remux/commit/f4212dd5b18696fcd72ac271566fd252642356ac))
+* query paramaters wrongly encoded resulting in wrong tmdb calls ([ef0ef77](https://github.com/lostb1t/remux/commit/ef0ef77a2b731cc2b07724875c59870295821cef))
+* respect enable_user_data and normalize NextUp cutoff handling ([#21](https://github.com/lostb1t/remux/issues/21)) ([9270125](https://github.com/lostb1t/remux/commit/9270125e869a68b0c6f3f53de6a133a9e1b8350b))
+* set DeliveryUrl on subtitle streams, respect device profile ([ac6c83b](https://github.com/lostb1t/remux/commit/ac6c83bb45698f63f65648b1adfce8c79c232ae4))
+* use source bitrate as encoding target, cap at max_streaming_bitrate ([d17203e](https://github.com/lostb1t/remux/commit/d17203e5617f9381386f3045a2b098ee9e541f51))
+* wrongly returning zero on items list with results ([d1125f1](https://github.com/lostb1t/remux/commit/d1125f16de8d32d8042ff9e8ddb707d6b96e0385))
+
+
+### Features
+
+* force plezy to reload versions ([4855d56](https://github.com/lostb1t/remux/commit/4855d560d0aed6ce9e9d2b734e15e3d7c9d1b2ab))
+* Implement AudioLanguagePreference and RememberAudioSelections user settings ([46d1284](https://github.com/lostb1t/remux/commit/46d1284f6def125332707c58bd9bd035cbe7130d))
+
+## [0.9.1](https://github.com/lostb1t/remux/compare/v0.9.0...v0.9.1) (2026-06-21)
+
+
+### Bug Fixes
+
+* pass --repo to gh release create to avoid missing git context ([99ad721](https://github.com/lostb1t/remux/commit/99ad721477228dbec84a45c8f75c83f9109632e5))
+* query paramaters wrongly encoded resulting in wrong tmdb calls ([ef0ef77](https://github.com/lostb1t/remux/commit/ef0ef77a2b731cc2b07724875c59870295821cef))
+
+# [0.9.0](https://github.com/lostb1t/remux/compare/v0.8.0...v0.9.0) (2026-06-21)
+
+
+### Bug Fixes
+
+* external subtitles for web ([aa335f1](https://github.com/lostb1t/remux/commit/aa335f10fa4817e827620fb847d76f2f18e0b904))
+* force nextup active-series join order ([#26](https://github.com/lostb1t/remux/issues/26)) ([fefccdf](https://github.com/lostb1t/remux/commit/fefccdf7f6608513a47f44032eb42322a8e00c9c))
+* handle progress reports without play session id ([#29](https://github.com/lostb1t/remux/issues/29)) ([5833a3f](https://github.com/lostb1t/remux/commit/5833a3f6679b7d0863cae8f57beea819fcb14539))
+* inherit runtime from ([a7a53cb](https://github.com/lostb1t/remux/commit/a7a53cbf6b1ba401bf24b1f5b32d754f4eb3fa07))
+* nextup was missing imported nedia [#14](https://github.com/lostb1t/remux/issues/14) ([5ec7471](https://github.com/lostb1t/remux/commit/5ec7471655db82523d1c37e1203423a6f23cd971))
+* optimize iptv purge ([4c64a89](https://github.com/lostb1t/remux/commit/4c64a89d4ed50020252855585d79d2ab3999057e))
+* order continue watching by play date ([#19](https://github.com/lostb1t/remux/issues/19)) ([17ac545](https://github.com/lostb1t/remux/commit/17ac5454fcb714df12a61b81819a8aef9e5d61a9))
+* persist probe data between stream refresh ([f4212dd](https://github.com/lostb1t/remux/commit/f4212dd5b18696fcd72ac271566fd252642356ac))
+* respect enable_user_data and normalize NextUp cutoff handling ([#21](https://github.com/lostb1t/remux/issues/21)) ([9270125](https://github.com/lostb1t/remux/commit/9270125e869a68b0c6f3f53de6a133a9e1b8350b))
+* set DeliveryUrl on subtitle streams, respect device profile ([ac6c83b](https://github.com/lostb1t/remux/commit/ac6c83bb45698f63f65648b1adfce8c79c232ae4))
+* use source bitrate as encoding target, cap at max_streaming_bitrate ([d17203e](https://github.com/lostb1t/remux/commit/d17203e5617f9381386f3045a2b098ee9e541f51))
+* wrongly returning zero on items list with results ([d1125f1](https://github.com/lostb1t/remux/commit/d1125f16de8d32d8042ff9e8ddb707d6b96e0385))
+
+
+### Features
+
+* force plezy to reload versions ([4855d56](https://github.com/lostb1t/remux/commit/4855d560d0aed6ce9e9d2b734e15e3d7c9d1b2ab))
+* Implement AudioLanguagePreference and RememberAudioSelections user settings ([46d1284](https://github.com/lostb1t/remux/commit/46d1284f6def125332707c58bd9bd035cbe7130d))
+
 # [0.8.0](https://github.com/lostb1t/remux-server/compare/v0.7.0...v0.8.0) (2026-06-15)
 
 

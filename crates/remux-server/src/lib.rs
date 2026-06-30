@@ -55,6 +55,7 @@ mod common;
 pub mod db;
 #[cfg(feature = "desktop")]
 pub mod embedded_static;
+pub mod intro;
 mod iptv;
 pub mod localization;
 pub mod playback_session;
@@ -249,7 +250,7 @@ pub async fn init_app(
     let ctx = AppContext {
         config,
         db: conn.clone(),
-        store: Store::new(100000),
+        store: Store::new(10000),
         sessions: playback_session::PlaybackSessionManager::new("transcode_sessions"),
         torrent: Arc::new(torrent_mgr),
         ws_tx: tokio::sync::broadcast::channel(128).0,
@@ -261,6 +262,11 @@ pub async fn init_app(
         web_paths,
         addons,
     };
+
+    // Sync intro items at startup (best-effort; errors are logged not fatal).
+    if let Err(e) = intro::sync_intros(&ctx).await {
+        warn!(err = ?e, "intro sync failed at startup");
+    }
 
     // Kill idle sessions after 30 minutes of no activity.
     // 30 min matches a "stepped away" scenario; pings keep active sessions alive indefinitely.
@@ -307,12 +313,22 @@ pub async fn init_app(
         .layer(on_error(log_api_error))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
-                .make_span_with(|_request: &axum::http::Request<axum::body::Body>| {
-                    tracing::info_span!("request", user = tracing::field::Empty)
+                .make_span_with(|request: &axum::http::Request<axum::body::Body>| {
+                    let uri = request.uri();
+                    let path = uri.path();
+                    let uri_str = match uri.query() {
+                        Some(q) => format!("{path}?{q}"),
+                        None => path.to_string(),
+                    };
+                    tracing::info_span!("request", user = tracing::field::Empty, uri = %uri_str)
                 })
                 .on_request(|request: &axum::http::Request<axum::body::Body>, _span: &tracing::Span| {
-                    debug!(method = %request.method(), uri = %request.uri().path(), "incoming request");
-                }),
+                    debug!(target: "remux_server::request", method = %request.method(), "→");
+                })
+                .on_response(|response: &axum::http::Response<axum::body::Body>, latency: std::time::Duration, _span: &tracing::Span| {
+                    debug!(target: "remux_server::request", status = %response.status().as_u16(), latency_ms = %latency.as_millis(), "←");
+                })
+                .on_failure(()),
         )
         .layer(cors);
 
@@ -409,6 +425,20 @@ pub struct Config {
     /// Path to the bgutil-pot binary used by yt-dlp for YouTube POT token generation.
     #[serde(default = "default_bgutil_script_path")]
     pub bgutil_script_path: std::path::PathBuf,
+    /// Base URL for the TMDB API. Overridable for testing.
+    #[serde(default = "default_tmdb_base_url")]
+    pub tmdb_base_url: String,
+    /// Base URL for the Trakt API. Overridable for testing.
+    #[serde(default = "default_trakt_base_url")]
+    pub trakt_base_url: String,
+}
+
+fn default_tmdb_base_url() -> String {
+    "https://api.themoviedb.org/3/".to_string()
+}
+
+fn default_trakt_base_url() -> String {
+    "https://api.trakt.tv".to_string()
 }
 
 fn default_bgutil_script_path() -> std::path::PathBuf {
@@ -468,6 +498,8 @@ impl Default for Config {
             disable_dht: false,
             torrent_peer_port: default_torrent_peer_port(),
             bgutil_script_path: default_bgutil_script_path(),
+            tmdb_base_url: default_tmdb_base_url(),
+            trakt_base_url: default_trakt_base_url(),
         }
         .resolve()
     }

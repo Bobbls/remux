@@ -149,6 +149,7 @@ impl Into<MediaType> for db::MediaKind {
             db::MediaKind::MusicGenre => MediaType::MusicGenre,
             db::MediaKind::Person => MediaType::Person,
             db::MediaKind::Studio => MediaType::Studio,
+            db::MediaKind::Country => MediaType::Studio,
             db::MediaKind::TvChannel => MediaType::TvChannel,
             db::MediaKind::TvProgram => MediaType::Program,
             db::MediaKind::Track => MediaType::Audio,
@@ -157,19 +158,21 @@ impl Into<MediaType> for db::MediaKind {
             db::MediaKind::Playlist => MediaType::Playlist,
             db::MediaKind::Stream | db::MediaKind::StreamGroup => MediaType::Video,
             db::MediaKind::Subtitle => MediaType::Video,
+            db::MediaKind::Intro => MediaType::Video,
         }
     }
 }
 
 pub fn db_media_kind_to_collection_type(
     kind: db::CollectionMediaKind,
-) -> CollectionType {
+) -> Option<CollectionType> {
     match kind {
-        db::CollectionMediaKind::Movie => CollectionType::Movies,
-        db::CollectionMediaKind::Series => CollectionType::Tvshows,
-        db::CollectionMediaKind::Music => CollectionType::Music,
-        db::CollectionMediaKind::Collection => CollectionType::Boxsets,
-        db::CollectionMediaKind::Playlist => CollectionType::Playlists,
+        db::CollectionMediaKind::Movie => Some(CollectionType::Movies),
+        db::CollectionMediaKind::Series => Some(CollectionType::Tvshows),
+        db::CollectionMediaKind::Mixed => Some(CollectionType::Mixed),
+        db::CollectionMediaKind::Music => Some(CollectionType::Music),
+        db::CollectionMediaKind::Collection => Some(CollectionType::Boxsets),
+        db::CollectionMediaKind::Playlist => Some(CollectionType::Playlists),
     }
 }
 
@@ -294,15 +297,9 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         overview: media
             .description
             .clone(),
-        play_access: matches!(
-            media.kind,
-            db::MediaKind::Movie
-                | db::MediaKind::Episode
-                | db::MediaKind::Track
-                | db::MediaKind::TvChannel
-                | db::MediaKind::TvProgram
-        )
-        .then(|| "Full".to_string()),
+        play_access: Some("Full".to_string()),
+        can_delete: Some(false),
+        can_download: Some(false),
         has_lyrics: (media.kind == db::MediaKind::Track).then_some(true),
         type_,
         parent_id: media
@@ -350,7 +347,8 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             db::MediaKind::Movie
             | db::MediaKind::Episode
             | db::MediaKind::TvChannel
-            | db::MediaKind::TvProgram => MediaType::Video,
+            | db::MediaKind::TvProgram
+            | db::MediaKind::Intro => MediaType::Video,
             db::MediaKind::Track => MediaType::Audio,
             db::MediaKind::Playlist => match media.collection_media_kind {
                 Some(db::CollectionMediaKind::Music) => MediaType::Audio,
@@ -362,9 +360,8 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         is_movie: (media.kind == db::MediaKind::Movie
             || matches!(media.program_kind, Some(db::ProgramKind::Movie)))
         .then_some(true),
-        is_series: (media.kind == db::MediaKind::Series
-            || matches!(media.program_kind, Some(db::ProgramKind::Series)))
-        .then_some(true),
+        is_series: matches!(media.program_kind, Some(db::ProgramKind::Series))
+            .then_some(true),
         is_news: media
             .program_kind
             .as_ref()
@@ -390,7 +387,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             .map(|d| d.year() as i64),
         community_rating: media
             .rating_audience
-            .clone(),
+            .map(|r| (r * 10.0).round() / 10.0),
         critic_rating: media
             .rating_critic
             .clone(),
@@ -417,7 +414,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             }),
             logo: media_image_tag(&media, db::ImageKind::Logo),
             backdrop: media_image_tag(&media, db::ImageKind::Backdrop),
-            ..Default::default()
+            thumb: media_image_tag(&media, db::ImageKind::Thumb),
         }),
         index_number: media.idx,
         is_folder: media
@@ -782,20 +779,43 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 .collection_default_sort_order
                 .clone(),
         }),
+        enable_media_source_display: Some(true),
         date_created: Some(
             media
                 .created_at
                 .and_utc()
-                .to_rfc3339(),
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         ),
-        production_locations: (media.kind == db::MediaKind::Person)
-            .then(|| {
-                media
-                    .country
-                    .clone()
-                    .map(|c| vec![c])
-            })
-            .flatten(),
+        original_language: media
+            .original_language
+            .clone(),
+        production_locations: {
+            let from_relations: Vec<String> = media
+                .relations
+                .as_ref()
+                .map(|rels| {
+                    rels.iter()
+                        .filter(|(_, m)| m.kind == db::MediaKind::Country)
+                        .map(|(_, m)| {
+                            m.title
+                                .clone()
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !from_relations.is_empty() {
+                Some(from_relations)
+            } else {
+                (media.kind == db::MediaKind::Person)
+                    .then(|| {
+                        media
+                            .country
+                            .clone()
+                            .map(|c| vec![c])
+                    })
+                    .flatten()
+            }
+        },
         ..Default::default()
     };
 
@@ -999,17 +1019,10 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
     }
 
     if media.kind == db::MediaKind::Collection {
-        item.collection_type = Some(
-            media
-                .collection_media_kind
-                .clone()
-                .map(db_media_kind_to_collection_type)
-                .unwrap_or(CollectionType::Unknown),
-        );
-        item.collection_kind = media
-            .collection_kind
-            .as_ref()
-            .map(|k| k.to_string());
+        item.collection_type = media
+            .collection_media_kind
+            .clone()
+            .and_then(db_media_kind_to_collection_type);
         if media.promoted {
             item.type_ = MediaType::CollectionFolder;
             item.display_preferences_id = Some(
@@ -1035,7 +1048,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
 
 // ── Remote Search DTOs ──────────────────────────────────────────────────────
 
-#[remux_macros::api_query]
+#[remux_macros::query]
 #[derive(Debug, Clone, Default)]
 pub struct ItemLookupInfo {
     pub name: Option<String>,
@@ -1043,7 +1056,7 @@ pub struct ItemLookupInfo {
     pub provider_ids: Option<std::collections::HashMap<String, String>>,
 }
 
-#[remux_macros::api_query]
+#[remux_macros::query]
 #[derive(Debug, Clone, Default)]
 pub struct RemoteSearchQuery {
     pub search_info: Option<ItemLookupInfo>,
@@ -1052,7 +1065,7 @@ pub struct RemoteSearchQuery {
     pub include_disabled_providers: Option<bool>,
 }
 
-#[remux_macros::api_query]
+#[remux_macros::query]
 #[derive(Debug, Clone, Default)]
 pub struct ApplySearchResultRequest {
     pub name: Option<String>,

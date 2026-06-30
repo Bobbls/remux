@@ -127,6 +127,7 @@ pub enum MediaKind {
     Person,
     Studio,
     Genre,
+    Country,
     MusicGenre,
     Collection,
     // purely here for jf
@@ -141,6 +142,7 @@ pub enum MediaKind {
     Playlist,
     StreamGroup,
     Subtitle,
+    Intro,
 }
 
 impl MediaKind {
@@ -217,7 +219,7 @@ impl Into<sdks::remux::MediaKind> for MediaKind {
             MediaKind::Folder => sdks::remux::MediaKind::Folder,
             MediaKind::Genre | MediaKind::MusicGenre => sdks::remux::MediaKind::Genre,
             MediaKind::Person => sdks::remux::MediaKind::Person,
-            MediaKind::Studio => sdks::remux::MediaKind::Studio,
+            MediaKind::Studio | MediaKind::Country => sdks::remux::MediaKind::Studio,
             MediaKind::Stream => sdks::remux::MediaKind::Stream,
             MediaKind::TvChannel => sdks::remux::MediaKind::TvChannel,
             MediaKind::TvProgram => sdks::remux::MediaKind::TvProgram,
@@ -227,6 +229,7 @@ impl Into<sdks::remux::MediaKind> for MediaKind {
             MediaKind::Playlist => sdks::remux::MediaKind::Playlist,
             MediaKind::StreamGroup => sdks::remux::MediaKind::Stream,
             MediaKind::Subtitle => sdks::remux::MediaKind::Stream,
+            MediaKind::Intro => sdks::remux::MediaKind::Stream,
         }
     }
 }
@@ -236,6 +239,7 @@ impl From<sdks::remux::MediaKind> for MediaKind {
         match k {
             sdks::remux::MediaKind::Movie => MediaKind::Movie,
             sdks::remux::MediaKind::Series => MediaKind::Series,
+            sdks::remux::MediaKind::Mixed => MediaKind::Collection,
             sdks::remux::MediaKind::Season => MediaKind::Season,
             sdks::remux::MediaKind::Episode => MediaKind::Episode,
             sdks::remux::MediaKind::Collection => MediaKind::Collection,
@@ -334,6 +338,7 @@ pub enum CollectionMediaKind {
     #[default]
     Movie,
     Series,
+    Mixed,
     Music,
     Collection,
     Playlist,
@@ -746,6 +751,7 @@ pub struct ExternalIds {
     pub deezer_artist: Option<i64>,
     pub deezer_album: Option<i64>,
     pub deezer_track: Option<i64>,
+    pub deezer_playlist: Option<i64>,
     pub youtube_id: Option<String>,
     pub iptv_source_id: Option<String>,
     pub iptv_group: Option<String>,
@@ -898,6 +904,7 @@ impl ExternalIds {
         merge_option(&mut self.deezer_artist, &source.deezer_artist, replace);
         merge_option(&mut self.deezer_album, &source.deezer_album, replace);
         merge_option(&mut self.deezer_track, &source.deezer_track, replace);
+        merge_option(&mut self.deezer_playlist, &source.deezer_playlist, replace);
         merge_option(&mut self.youtube_id, &source.youtube_id, replace);
         merge_option(&mut self.iptv_source_id, &source.iptv_source_id, replace);
         merge_option(&mut self.iptv_group, &source.iptv_group, replace);
@@ -958,6 +965,7 @@ pub struct MediaFilter {
     pub total_count: bool,
     pub include_user_state: bool,
     pub include_child_count: bool,
+    pub include_relations: bool,
     /// User ID to use when loading user state (separate from user_state filter)
     pub user_id: Option<Uuid>,
     pub user_state: Option<super::UserMediaStateFilter>,
@@ -985,19 +993,20 @@ pub struct MediaFilter {
     pub parent_enabled: Option<bool>,
     /// Filter albums/tracks by artist (parent_id IN these IDs).
     pub artist_ids: Option<Vec<Uuid>>,
-    /// If set, hides items whose known release date is in the future.
-    /// `digital_released_at` is checked first; if absent, `released_at` is used as a fallback.
-    /// Items where both dates are NULL are shown (no date info = no restriction).
+    /// If set, hides items whose digital release date exceeds this threshold.
+    /// `digital_released_at` is used first. Items with no digital date but a `released_at`
+    /// within the past year are always hidden (theatrical-only, digital date unknown).
+    /// Older items without a digital date fall back to `released_at`.
     pub digital_released_before: Option<NaiveDateTime>,
     /// Sort order for results. Mapped from Jellyfin's ItemSortBy.
     pub sort_by: Vec<api::ItemSortBy>,
     pub sort_order: Vec<api::SortOrder>,
     /// For TvProgram queries: order by the parent channel's sort_order / channel_number.
     pub sort_by_channel_order: bool,
-    /// Structured filter rules (from smart collections). Evaluated with `filter_match`.
-    pub filter_rules: Vec<remux_sdks::remux::FilterRule>,
-    /// Whether all rules must match (AND) or any rule (OR). Defaults to All.
-    pub filter_match: remux_sdks::remux::FilterMatchMode,
+    /// Structured filter from a smart collection (groups of rules).
+    pub filter_rules: Option<remux_sdks::remux::CollectionFilter>,
+    /// Structured filter from user policy (applied separately, never on containers).
+    pub policy_filter: Option<remux_sdks::remux::CollectionFilter>,
     /// Filter TvChannels by country code (ISO 3166-1 alpha-2, case-insensitive).
     pub country_filter: Option<String>,
     /// Filter TvChannels by group (M3U group-title / Xtream category).
@@ -1093,6 +1102,8 @@ pub struct Media {
     pub certification_age: Option<i32>,
     /// ISO 3166-1 alpha-2 country code (e.g. "US", "GB").
     pub country: Option<String>,
+    /// BCP 47 language tag of the original language (e.g. "en", "fr").
+    pub original_language: Option<String>,
     #[sqlx(skip)]
     pub images: MediaImages,
     pub status: Option<MediaStatus>,
@@ -1111,6 +1122,10 @@ pub struct Media {
     //pub description: Option<String>,
     #[sqlx(skip)]
     pub tags: Vec<String>,
+    /// Set by TMDB meta fetch; written to `popularity_raw` by `save_pending_popularity`.
+    #[sqlx(skip)]
+    #[serde(skip)]
+    pub pending_popularity: Option<(String, crate::addons::MetricValue)>,
     #[sqlx(skip)]
     pub child_count: Option<i64>,
     #[sqlx(skip)]
@@ -1566,9 +1581,10 @@ impl Media {
             external_ids, external_ratings, created_at, updated_at, certification, certification_age, parent_idx,
             live_start, live_end, tvg_id, channel_number, enabled, sort_order, custom_name, digital_released_at, status, refreshed_at, grandparent_id,
             collection_smart_filter, country, program_kind, collection_latest_auto_unplayed, collection_latest_sort_digital,
-            collection_source, collection_default_sort, collection_default_sort_order
+            collection_source, collection_default_sort, collection_default_sort_order,
+            original_language
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44)
         ON CONFLICT (id) DO UPDATE SET
             title = excluded.title,
             kind = excluded.kind,
@@ -1609,7 +1625,8 @@ impl Media {
             custom_name = excluded.custom_name,
             status = COALESCE(excluded.status, media.status),
             refreshed_at = COALESCE(excluded.refreshed_at, media.refreshed_at),
-            program_kind = excluded.program_kind
+            program_kind = excluded.program_kind,
+            original_language = COALESCE(excluded.original_language, media.original_language)
         "#,
         )
         .bind(self.id)
@@ -1655,6 +1672,7 @@ impl Media {
         .bind(&self.collection_source)
         .bind(sqlx::types::Json(&self.collection_default_sort))
         .bind(sqlx::types::Json(&self.collection_default_sort_order))
+        .bind(&self.original_language)
         .execute(db)
         .await?;
 
@@ -1706,7 +1724,8 @@ impl Media {
                 rating_critic, rating_audience, description, trailers, stream_info, probe_data, promoted, collection_kind, collection_media_kind,
                 external_ids, external_ratings, created_at, updated_at, certification, certification_age, parent_idx,
                 live_start, live_end, tvg_id, channel_number, enabled, sort_order, custom_name, digital_released_at, status, grandparent_id, country, program_kind, collection_latest_auto_unplayed, collection_latest_sort_digital,
-                collection_source, collection_default_sort, collection_default_sort_order
+                collection_source, collection_default_sort, collection_default_sort_order,
+                original_language
             )",
         );
             for item in chunk {
@@ -1760,7 +1779,8 @@ impl Media {
                     .push_bind(&item.collection_latest_sort_digital)
                     .push_bind(&item.collection_source)
                     .push_bind(sqlx::types::Json(&item.collection_default_sort))
-                    .push_bind(sqlx::types::Json(&item.collection_default_sort_order));
+                    .push_bind(sqlx::types::Json(&item.collection_default_sort_order))
+                    .push_bind(&item.original_language);
             });
 
             query_builder.push(" ON CONFLICT DO NOTHING");
@@ -1814,7 +1834,8 @@ impl Media {
                 rating_critic, rating_audience, description, trailers, stream_info, probe_data, promoted, collection_kind, collection_media_kind,
                 external_ids, external_ratings, created_at, updated_at, certification, certification_age, parent_idx,
                 live_start, live_end, tvg_id, channel_number, enabled, sort_order, custom_name, digital_released_at, status, refreshed_at, grandparent_id, country, program_kind, collection_latest_auto_unplayed, collection_latest_sort_digital,
-                collection_source, collection_default_sort, collection_default_sort_order
+                collection_source, collection_default_sort, collection_default_sort_order,
+                original_language
             )",
         );
 
@@ -1867,7 +1888,8 @@ impl Media {
                     .push_bind(&item.collection_latest_sort_digital)
                     .push_bind(&item.collection_source)
                     .push_bind(sqlx::types::Json(&item.collection_default_sort))
-                    .push_bind(sqlx::types::Json(&item.collection_default_sort_order));
+                    .push_bind(sqlx::types::Json(&item.collection_default_sort_order))
+                    .push_bind(&item.original_language);
             });
 
             query_builder.push(
@@ -1904,7 +1926,8 @@ impl Media {
                 enabled = CASE WHEN media.id IS NOT NULL THEN media.enabled ELSE excluded.enabled END,
                 sort_order = CASE WHEN media.id IS NOT NULL THEN media.sort_order ELSE excluded.sort_order END,
                 custom_name = media.custom_name,
-                program_kind = excluded.program_kind",
+                program_kind = excluded.program_kind,
+                original_language = COALESCE(excluded.original_language, media.original_language)",
             );
 
             query_builder
@@ -2176,6 +2199,41 @@ impl Media {
                 })
                 .unwrap_or(false);
 
+        // When sorting by DatePlayed, drive records_qb FROM user_media_state (dp) so
+        // the result is already in last_played_at order — no correlated subquery per row,
+        // no separate sort pass. Column names in subsequent WHERE clauses (kind, parent_id,
+        // etc.) resolve unambiguously to media since dp only exposes (user_id, media_id,
+        // last_played_at). Applied to all query shapes so dp.last_played_at in ORDER BY
+        // is always valid when user_id is set.
+        let date_played_uid = filter
+            .sort_by
+            .iter()
+            .any(|s| matches!(s, api::ItemSortBy::DatePlayed))
+            .then(|| {
+                filter
+                    .user_id
+                    .as_ref()
+            })
+            .flatten();
+
+        // When sorting by a single-period popularity metric, pre-compute scores via a
+        // LEFT JOIN on a derived table so SQLite materialises popularity_agg once and
+        // joins with a hash-join rather than executing 2 correlated subqueries per
+        // qualifying row in ORDER BY. PopularityAllTime spans 3 periods and stays with
+        // the correlated-subquery path.
+        let pop_period: Option<&'static str> = filter
+            .sort_by
+            .iter()
+            .find_map(|s| match s {
+                api::ItemSortBy::TrendingWeek => Some("trend_week"),
+                api::ItemSortBy::TrendingMonth => Some("trend_month"),
+                api::ItemSortBy::PopularityDay => Some("daily"),
+                api::ItemSortBy::PopularityWeek => Some("weekly"),
+                api::ItemSortBy::PopularityMonth => Some("monthly"),
+                _ => None,
+            });
+        let mut pop_joined = false;
+
         let mut count_qb;
         let mut records_qb;
 
@@ -2198,10 +2256,26 @@ impl Media {
                 "WITH RECURSIVE subtree AS (SELECT id FROM media WHERE parent_id = ",
             );
             records_qb.push_bind(parent_id);
-            records_qb.push(
-                " UNION ALL SELECT m.id FROM media m INNER JOIN subtree s ON m.parent_id = s.id\
-                ) SELECT * FROM media WHERE id IN (SELECT id FROM subtree) AND 1=1",
-            );
+            if let Some(uid) = date_played_uid {
+                // CROSS JOIN prevents SQLite from reordering the tables, forcing
+                // user_media_state as the outer loop. Combined with
+                // idx_ums_user_last_played(user_id, last_played_at DESC), SQLite
+                // scans the user's plays in order and can stop at LIMIT without
+                // sorting the full result set. The join condition is in WHERE so
+                // the planner still applies it as a filter (not a cartesian product).
+                records_qb.push(
+                    " UNION ALL SELECT m.id FROM media m INNER JOIN subtree s ON m.parent_id = s.id\
+                    ) SELECT media.* FROM user_media_state dp CROSS JOIN media \
+                    WHERE dp.user_id = ",
+                );
+                records_qb.push_bind(uid);
+                records_qb.push(" AND dp.media_id = media.id AND media.id IN (SELECT id FROM subtree) AND 1=1");
+            } else {
+                records_qb.push(
+                    " UNION ALL SELECT m.id FROM media m INNER JOIN subtree s ON m.parent_id = s.id\
+                    ) SELECT * FROM media WHERE id IN (SELECT id FROM subtree) AND 1=1",
+                );
+            }
         } else if use_recursive && is_genre_scope_query {
             // CTE at top level so we can reference it in the relation subquery below,
             // but the base query is plain — no id IN subtree baked in.
@@ -2223,10 +2297,20 @@ impl Media {
                 "WITH RECURSIVE subtree AS (SELECT id FROM media WHERE parent_id = ",
             );
             records_qb.push_bind(parent_id);
-            records_qb.push(
-                " UNION ALL SELECT m.id FROM media m INNER JOIN subtree s ON m.parent_id = s.id\
-                ) SELECT * FROM media WHERE 1=1",
-            );
+            if let Some(uid) = date_played_uid {
+                records_qb.push(
+                    " UNION ALL SELECT m.id FROM media m INNER JOIN subtree s ON m.parent_id = s.id\
+                    ) SELECT media.* FROM user_media_state dp CROSS JOIN media \
+                    WHERE dp.user_id = ",
+                );
+                records_qb.push_bind(uid);
+                records_qb.push(" AND dp.media_id = media.id AND 1=1");
+            } else {
+                records_qb.push(
+                    " UNION ALL SELECT m.id FROM media m INNER JOIN subtree s ON m.parent_id = s.id\
+                    ) SELECT * FROM media WHERE 1=1",
+                );
+            }
         } else if is_manual_collection {
             let collection_id = filter
                 .parent_id
@@ -2241,45 +2325,56 @@ impl Media {
             count_qb.push_bind(collection_id);
             count_qb.push(" WHERE 1=1");
 
-            records_qb = sqlx::QueryBuilder::new(
-                "SELECT media.* FROM media \
-                 JOIN media_relations mr ON mr.right_media_id = media.id \
-                 AND mr.role = 'collection' AND mr.left_media_id = ",
-            );
-            records_qb.push_bind(collection_id);
-            records_qb.push(" WHERE 1=1");
+            if let Some(uid) = date_played_uid {
+                records_qb = sqlx::QueryBuilder::new(
+                    "SELECT media.* FROM user_media_state dp CROSS JOIN media \
+                     JOIN media_relations mr ON mr.right_media_id = media.id \
+                     AND mr.role = 'collection' AND mr.left_media_id = ",
+                );
+                records_qb.push_bind(collection_id);
+                records_qb.push(" WHERE dp.user_id = ");
+                records_qb.push_bind(uid);
+                records_qb.push(" AND dp.media_id = media.id AND 1=1");
+            } else {
+                records_qb = sqlx::QueryBuilder::new(
+                    "SELECT media.* FROM media \
+                     JOIN media_relations mr ON mr.right_media_id = media.id \
+                     AND mr.role = 'collection' AND mr.left_media_id = ",
+                );
+                records_qb.push_bind(collection_id);
+                records_qb.push(" WHERE 1=1");
+            }
         } else {
             count_qb = sqlx::QueryBuilder::new(
                 "SELECT COUNT(*) as count FROM media WHERE 1=1",
             );
-            // When sorting by DatePlayed, drive records_qb FROM user_media_state so
-            // the result is already in last_played_at order — no correlated subquery
-            // per row, no separate sort pass. Column names in subsequent WHERE clauses
-            // (kind, parent_id, etc.) resolve unambiguously to media since the dp
-            // derived table only exposes (media_id, last_played_at).
-            let date_played_uid = filter
-                .sort_by
-                .iter()
-                .any(|s| matches!(s, api::ItemSortBy::DatePlayed))
-                .then(|| {
-                    filter
-                        .user_id
-                        .as_ref()
-                })
-                .flatten();
             if let Some(uid) = date_played_uid {
-                // CROSS JOIN prevents SQLite from reordering the tables, forcing
-                // user_media_state as the outer loop. Combined with
-                // idx_ums_user_last_played(user_id, last_played_at DESC), SQLite
-                // scans the user's plays in order and can stop at LIMIT without
-                // sorting the full result set. The join condition is in WHERE so
-                // the planner still applies it as a filter (not a cartesian product).
                 records_qb = sqlx::QueryBuilder::new(
                     "SELECT media.* FROM user_media_state dp \
                      CROSS JOIN media WHERE dp.user_id = ",
                 );
                 records_qb.push_bind(uid);
                 records_qb.push(" AND media.id = dp.media_id AND 1=1");
+            } else if let Some(period) = pop_period {
+                // Materialise the latest per-media popularity score once and JOIN it in
+                // so ORDER BY uses a plain column reference instead of N correlated
+                // subqueries — one per qualifying row before LIMIT is applied.
+                pop_joined = true;
+                records_qb = sqlx::QueryBuilder::new(format!(
+                    "SELECT media.* FROM media \
+                     LEFT JOIN (\
+                       SELECT pa.media_id, pa.avg \
+                       FROM popularity_agg pa \
+                       WHERE pa.period = '{period}' \
+                         AND pa.period_key = (\
+                           SELECT MAX(pa2.period_key) FROM popularity_agg pa2 \
+                           WHERE pa2.media_id = pa.media_id \
+                             AND pa2.period = '{period}' \
+                             AND pa2.period_key <= date('now')\
+                         )\
+                     ) pop ON pop.media_id = media.id \
+                     WHERE 1=1"
+                ));
             } else {
                 records_qb = sqlx::QueryBuilder::new("SELECT * FROM media WHERE 1=1");
             }
@@ -2289,65 +2384,88 @@ impl Media {
         // here rather than in the main query. The main query then contains only
         // `WHERE media.id IN (ids)` which forces SQLite to use individual PK lookups
         // (O(n_ids)) instead of scanning the entire kind-filtered media table (O(total_media)).
-        let resumable_ids: Option<Vec<uuid::Uuid>> = if let Some(usf) =
-            &filter.user_state
-        {
-            if usf.resumable == Some(true) {
-                let ids: Vec<uuid::Uuid> = if let Some(user_id) = &usf.user_id {
-                    // Drive from user_media_state (small, indexed by user_id) and
-                    // check media conditions via a correlated EXISTS so SQLite does
-                    // one PK lookup per in-progress item instead of materialising
-                    // the entire kind/date-filtered media set.
-                    let mut pre_qb = sqlx::QueryBuilder::new(
-                        "SELECT media_id FROM user_media_state \
+        let resumable_ids: Option<Vec<uuid::Uuid>> =
+            if let Some(usf) = &filter.user_state {
+                if usf.resumable == Some(true) {
+                    let ids: Vec<uuid::Uuid> = if let Some(user_id) = &usf.user_id {
+                        // Drive from user_media_state (small, indexed by user_id) and
+                        // check media conditions via a correlated EXISTS so SQLite does
+                        // one PK lookup per in-progress item instead of materialising
+                        // the entire kind/date-filtered media set.
+                        let mut pre_qb = sqlx::QueryBuilder::new(
+                            "SELECT media_id FROM user_media_state \
                          WHERE user_id = ",
-                    );
-                    pre_qb.push_bind(user_id);
-                    pre_qb.push(" AND playback_position > 0 AND play_count = 0");
-                    let needs_media_filter = filter
-                        .kind
-                        .as_ref()
-                        .map(|k| !k.is_empty())
-                        .unwrap_or(false)
-                        || filter
-                            .digital_released_before
-                            .is_some();
-                    if needs_media_filter {
-                        pre_qb.push(
-                            " AND EXISTS (SELECT 1 FROM media \
-                             WHERE id = media_id AND 1=1",
                         );
-                        if let Some(kinds) = &filter.kind {
-                            if !kinds.is_empty() {
-                                pre_qb.push(" AND kind IN (");
-                                let mut sep = pre_qb.separated(", ");
-                                for k in kinds {
-                                    sep.push_bind(k);
+                        pre_qb.push_bind(user_id);
+                        pre_qb.push(" AND playback_position > 0 AND play_count = 0");
+                        let needs_media_filter = filter
+                            .kind
+                            .as_ref()
+                            .map(|k| !k.is_empty())
+                            .unwrap_or(false)
+                            || filter
+                                .digital_released_before
+                                .is_some();
+                        if needs_media_filter {
+                            pre_qb.push(
+                                " AND EXISTS (SELECT 1 FROM media \
+                             WHERE id = media_id AND 1=1",
+                            );
+                            if let Some(kinds) = &filter.kind {
+                                if !kinds.is_empty() {
+                                    pre_qb.push(" AND kind IN (");
+                                    let mut sep = pre_qb.separated(", ");
+                                    for k in kinds {
+                                        sep.push_bind(k);
+                                    }
+                                    pre_qb.push(")");
                                 }
-                                pre_qb.push(")");
                             }
+                            if let Some(&threshold) = filter
+                                .digital_released_before
+                                .as_ref()
+                            {
+                                push_release_date_filter(
+                                    &mut pre_qb,
+                                    "media",
+                                    threshold,
+                                    true,
+                                );
+                            }
+                            pre_qb.push(")");
                         }
-                        if let Some(threshold) = &filter.digital_released_before {
-                            pre_qb
-                                .push(" AND COALESCE(digital_released_at, released_at, '1900-01-01 00:00:00') <= ")
-                                .push_bind(threshold);
-                        }
-                        pre_qb.push(")");
-                    }
-                    pre_qb
-                        .build_query_scalar::<uuid::Uuid>()
-                        .fetch_all(db)
-                        .await?
+                        pre_qb
+                            .build_query_scalar::<uuid::Uuid>()
+                            .fetch_all(db)
+                            .await?
+                    } else {
+                        vec![]
+                    };
+                    Some(ids)
                 } else {
-                    vec![]
-                };
-                Some(ids)
+                    None
+                }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
+
+        // series_excluded: no series possible → use NOT IN bloom filter for unplayed
+        // series_only:     only series → emit episode EXISTS directly (no CASE wrapper)
+        // else (mixed):    OR-split so non-series still get the bloom filter
+        let series_excluded = filter
+            .kind
+            .as_ref()
+            .map(|k| !k.is_empty() && !k.contains(&MediaKind::Series))
+            .unwrap_or(false);
+        let series_only = filter
+            .kind
+            .as_ref()
+            .map(|k| {
+                !k.is_empty()
+                    && k.iter()
+                        .all(|k| matches!(k, MediaKind::Series))
+            })
+            .unwrap_or(false);
 
         for qb in [&mut count_qb, &mut records_qb] {
             if is_genre_scope_query {
@@ -2681,21 +2799,29 @@ impl Media {
                 }
             }
 
-            if let Some(threshold) = &filter.digital_released_before {
+            if let Some(&threshold) = filter
+                .digital_released_before
+                .as_ref()
+            {
                 if resumable_ids.is_none() {
-                    // 3-arg COALESCE maps NULL-date items to the sentinel '1900-01-01 00:00:00'
-                    // so they always pass the <= check without an OR branch, enabling a range
-                    // scan on idx_media_kind_avail_sentinel.
-                    qb.push(" AND COALESCE(digital_released_at, released_at, '1900-01-01 00:00:00') <= ")
-                        .push_bind(threshold);
+                    let season_only = filter
+                        .kind
+                        .as_ref()
+                        .map(|k| {
+                            !k.is_empty()
+                                && k.iter()
+                                    .all(|k| matches!(k, MediaKind::Season))
+                        })
+                        .unwrap_or(false);
+                    push_release_date_filter(qb, "media", threshold, !season_only);
                 }
             }
 
-            if !filter
-                .filter_rules
-                .is_empty()
-            {
-                apply_filter_rules(qb, &filter.filter_rules, &filter.filter_match);
+            if let Some(ref f) = filter.filter_rules {
+                apply_filter_rules(qb, f);
+            }
+            if let Some(ref f) = filter.policy_filter {
+                apply_filter_rules(qb, f);
             }
         }
         // Apply ORDER BY driven by the sort_by field, with per-kind fallbacks.
@@ -2769,20 +2895,95 @@ impl Media {
                             format!("(sort_order IS NULL), COALESCE(sort_order, channel_number, 999999) {dir}, title COLLATE NOCASE")
                         }
                         api::ItemSortBy::CatalogOrder => {
-                            let src = filter.filter_rules.iter().find_map(|r| {
-                                if let sdks::remux::FilterRule::Catalog { catalog_id } = r {
-                                    Some(catalog_id.simple().to_string())
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(cid_hex) = src {
+                            let catalog_ids: Vec<String> = filter
+                                .filter_rules
+                                .iter()
+                                .flat_map(|cf| cf.groups.iter().flat_map(|g| g.rules.iter()))
+                                .find_map(|r| {
+                                    if let sdks::remux::FilterRule::Catalog { catalog_ids, .. } = r {
+                                        Some(catalog_ids.iter().map(|id| id.simple().to_string()).collect())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or_default();
+                            if !catalog_ids.is_empty() {
+                                let in_clause = catalog_ids
+                                    .iter()
+                                    .map(|hex| format!("X'{hex}'"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
                                 format!(
-                                    "COALESCE((SELECT mr.weight FROM media_relations mr \
-                                     WHERE mr.right_media_id = media.id AND mr.role = 'catalog' AND mr.left_media_id = X'{cid_hex}'), 999999) ASC"
+                                    "COALESCE((SELECT MIN(mr.weight) FROM media_relations mr \
+                                     WHERE mr.right_media_id = media.id AND mr.role = 'catalog' \
+                                     AND mr.left_media_id IN ({in_clause})), 999999) ASC"
                                 )
                             } else {
                                 format!("title COLLATE NOCASE {dir}")
+                            }
+                        }
+                        api::ItemSortBy::PopularityAllTime => {
+                            // all-time → most recent yearly → most recent monthly → 0
+                            "COALESCE(\
+                               (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'all' AND pa.period_key = 'all'),\
+                               (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'yearly' ORDER BY pa.period_key DESC LIMIT 1),\
+                               (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'monthly' ORDER BY pa.period_key DESC LIMIT 1),\
+                               0) DESC"
+                                .to_string()
+                        }
+                        api::ItemSortBy::PopularityDay => {
+                            if pop_joined {
+                                "COALESCE(pop.avg, 0) DESC".to_string()
+                            } else {
+                                "COALESCE(\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'daily' AND pa.period_key = date('now')),\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'daily' ORDER BY pa.period_key DESC LIMIT 1),\
+                                   0) DESC"
+                                    .to_string()
+                            }
+                        }
+                        api::ItemSortBy::PopularityWeek => {
+                            if pop_joined {
+                                "COALESCE(pop.avg, 0) DESC".to_string()
+                            } else {
+                                "COALESCE(\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'weekly' AND pa.period_key = date('now', 'weekday 0', '-6 days')),\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'weekly' ORDER BY pa.period_key DESC LIMIT 1),\
+                                   0) DESC"
+                                    .to_string()
+                            }
+                        }
+                        api::ItemSortBy::PopularityMonth => {
+                            if pop_joined {
+                                "COALESCE(pop.avg, 0) DESC".to_string()
+                            } else {
+                                "COALESCE(\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'monthly' AND pa.period_key = strftime('%Y-%m', 'now')),\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'monthly' ORDER BY pa.period_key DESC LIMIT 1),\
+                                   0) DESC"
+                                    .to_string()
+                            }
+                        }
+                        api::ItemSortBy::TrendingWeek => {
+                            if pop_joined {
+                                "COALESCE(pop.avg, 0) DESC".to_string()
+                            } else {
+                                "COALESCE(\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_week' AND pa.period_key = date('now')),\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_week' ORDER BY pa.period_key DESC LIMIT 1),\
+                                   0) DESC"
+                                    .to_string()
+                            }
+                        }
+                        api::ItemSortBy::TrendingMonth => {
+                            if pop_joined {
+                                "COALESCE(pop.avg, 0) DESC".to_string()
+                            } else {
+                                "COALESCE(\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_month' AND pa.period_key = date('now')),\
+                                   (SELECT pa.avg FROM popularity_agg pa WHERE pa.media_id = media.id AND pa.period = 'trend_month' ORDER BY pa.period_key DESC LIMIT 1),\
+                                   0) DESC"
+                                    .to_string()
                             }
                         }
                         // Default fallback
@@ -2823,6 +3024,9 @@ impl Media {
 
         let (count, records_result) = tokio::join!(
             async {
+                if !filter.total_count {
+                    return Ok(0_usize);
+                }
                 let query = count_qb.build();
                 let row = query
                     .fetch_one(db)
@@ -2836,9 +3040,7 @@ impl Media {
                     .await
             }
         );
-
         let mut records = records_result?;
-
         if !records.is_empty() {
             let ids: Vec<Uuid> = records
                 .iter()
@@ -2881,19 +3083,23 @@ impl Media {
             }
         }
 
-        let rel_ids: Vec<Uuid> = records
-            .iter()
-            .filter(|m| {
-                matches!(
-                    m.kind,
-                    MediaKind::Movie
-                        | MediaKind::Episode
-                        | MediaKind::Series
-                        | MediaKind::Season
-                )
-            })
-            .map(|m| m.id)
-            .collect();
+        let rel_ids: Vec<Uuid> = if filter.include_relations {
+            records
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m.kind,
+                        MediaKind::Movie
+                            | MediaKind::Episode
+                            | MediaKind::Series
+                            | MediaKind::Season
+                    )
+                })
+                .map(|m| m.id)
+                .collect()
+        } else {
+            vec![]
+        };
         if !rel_ids.is_empty() {
             let mut g_qb = sqlx::QueryBuilder::new(
                 // Drive from media_relations using the left_media_id index.
@@ -2929,6 +3135,8 @@ impl Media {
                             MediaKind::Genre
                                 | MediaKind::MusicGenre
                                 | MediaKind::Person
+                                | MediaKind::Studio
+                                | MediaKind::Country
                         ) {
                             continue;
                         }
@@ -3317,7 +3525,11 @@ impl Media {
                            AND ums.user_id = ",
                     );
                     qb.push_bind(user_id);
-                    qb.push(" AND ums.play_count > 0) GROUP BY e.grandparent_id");
+                    qb.push(" AND ums.play_count > 0)");
+                    if let Some(t) = filter.digital_released_before {
+                        push_release_date_filter(&mut qb, "e", t, true);
+                    }
+                    qb.push(" GROUP BY e.grandparent_id");
 
                     match qb
                         .build()
@@ -3644,6 +3856,15 @@ impl Media {
                 None
             };
 
+        let has_tv_channel = kinds.contains(&MediaKind::TvChannel);
+        let has_playlist = kinds.contains(&MediaKind::Playlist);
+        // True only when the query exclusively targets container kinds (no content mixed in).
+        // Used to skip content filter rules on container queries and to hide empty containers.
+        let targeting_containers = !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|k| matches!(k, MediaKind::Collection | MediaKind::Folder));
+
         let release_date_applies = !kinds.is_empty()
             && kinds
                 .iter()
@@ -3656,25 +3877,9 @@ impl Media {
                             | MediaKind::Episode
                     )
                 });
-        let digital_released_before = if release_date_applies
-            && server_config.map(|c| c.filter_by_digital_release_date) != Some(false)
-        {
-            let buffer = server_config
-                .map(|c| c.digital_release_buffer_days)
-                .unwrap_or(0);
-            Some(Utc::now().naive_utc() + Duration::days(buffer))
-        } else {
-            None
-        };
-
-        let has_tv_channel = kinds.contains(&MediaKind::TvChannel);
-        let has_playlist = kinds.contains(&MediaKind::Playlist);
-        // True only when the query exclusively targets container kinds (no content mixed in).
-        // Used to skip content filter rules on container queries and to hide empty containers.
-        let targeting_containers = !kinds.is_empty()
-            && kinds
-                .iter()
-                .all(|k| matches!(k, MediaKind::Collection | MediaKind::Folder));
+        let digital_released_before = release_date_applies
+            .then(|| server_config.and_then(|c| c.release_date_threshold()))
+            .flatten();
 
         let user_policy_filter = user_policy.and_then(|p| {
             p.filter_rules
@@ -3720,6 +3925,16 @@ impl Media {
                         .as_deref()
                         .map(|f| f.contains(&api::ItemFields::ChildCount))
                         .unwrap_or(false),
+                include_relations: filter
+                    .fields
+                    .as_deref()
+                    .map(|f| {
+                        f.contains(&api::ItemFields::People)
+                            || f.contains(&api::ItemFields::Genres)
+                            || f.contains(&api::ItemFields::Studios)
+                            || f.contains(&api::ItemFields::ProductionLocations)
+                    })
+                    .unwrap_or(false),
                 total_count,
                 user_state,
                 genre_ids,
@@ -3770,31 +3985,14 @@ impl Media {
                     .sort_order
                     .clone()
                     .unwrap_or_default(),
-                filter_rules: {
-                    let mut rules = smart_filter
-                        .map(|sf| {
-                            sf.rules
-                                .clone()
-                        })
-                        .unwrap_or_default();
-                    // Content filter rules must not apply to container queries — only
-                    // to content (movies, episodes, etc.). See CLAUDE.md.
-                    if !targeting_containers {
-                        if let Some(pf) = user_policy_filter {
-                            rules.extend(
-                                pf.rules
-                                    .clone(),
-                            );
-                        }
-                    }
-                    rules
+                filter_rules: smart_filter.cloned(),
+                // Content filter rules must not apply to container queries — only
+                // to content (movies, episodes, etc.). See CLAUDE.md.
+                policy_filter: if !targeting_containers {
+                    user_policy_filter.cloned()
+                } else {
+                    None
                 },
-                filter_match: smart_filter
-                    .map(|sf| {
-                        sf.match_mode
-                            .clone()
-                    })
-                    .unwrap_or_default(),
                 artist_ids: filter
                     .artist_ids
                     .clone()
@@ -3823,9 +4021,13 @@ impl Media {
                 .is_empty()
         {
             if let Some(pf) = user_policy_filter {
-                if !pf
-                    .rules
-                    .is_empty()
+                if pf
+                    .groups
+                    .iter()
+                    .any(|g| {
+                        !g.rules
+                            .is_empty()
+                    })
                 {
                     let container_ids: Vec<uuid::Uuid> = result
                         .records
@@ -3842,7 +4044,7 @@ impl Media {
                     qb.push(
                         ") AND kind NOT IN ('collection', 'folder', 'playlist', 'tv_channel')",
                     );
-                    apply_filter_rules(&mut qb, &pf.rules, &pf.match_mode);
+                    apply_filter_rules(&mut qb, pf);
                     qb.push(" GROUP BY parent_id");
 
                     if let Ok(rows) = qb
@@ -4336,6 +4538,7 @@ impl Media {
         db: &SqlitePool,
         user: &super::User,
         recursive: bool,
+        release_threshold: Option<chrono::NaiveDateTime>,
     ) -> Result<super::UserMediaState> {
         let now = Local::now().naive_local();
         let state = self
@@ -4349,101 +4552,50 @@ impl Media {
         match self.kind {
             MediaKind::Episode => {
                 if let Some(season_id) = self.parent_id {
-                    let unplayed: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM media e \
-                         WHERE e.parent_id = ? AND e.kind = 'episode' \
-                         AND NOT EXISTS (\
-                           SELECT 1 FROM user_media_state ums \
-                           WHERE ums.media_id = e.id \
-                           AND ums.user_id = ? \
-                           AND ums.play_count > 0\
-                         )",
+                    let unplayed = count_unplayed_children(
+                        db,
+                        season_id,
+                        MediaKind::Episode,
+                        user.id,
+                        release_threshold,
                     )
-                    .bind(season_id)
-                    .bind(user.id)
-                    .fetch_one(db)
-                    .await
-                    .unwrap_or(1);
-
+                    .await;
                     if unplayed == 0 {
                         if let Ok(Some(season)) = Self::get_by_id(db, &season_id).await
                         {
                             season
                                 .apply_played(db, user, now)
                                 .await?;
-
-                            if let Some(series_id) = season.parent_id {
-                                let unplayed_seasons: i64 = sqlx::query_scalar(
-                                    "SELECT COUNT(*) FROM media s \
-                                     WHERE s.parent_id = ? AND s.kind = 'season' \
-                                     AND NOT EXISTS (\
-                                       SELECT 1 FROM user_media_state ums \
-                                       WHERE ums.media_id = s.id \
-                                       AND ums.user_id = ? \
-                                       AND ums.play_count > 0\
-                                     )",
-                                )
-                                .bind(series_id)
-                                .bind(user.id)
-                                .fetch_one(db)
-                                .await
-                                .unwrap_or(1);
-
-                                if unplayed_seasons == 0 {
-                                    if let Ok(Some(series)) =
-                                        Self::get_by_id(db, &series_id).await
-                                    {
-                                        series
-                                            .apply_played(db, user, now)
-                                            .await?;
-                                    }
-                                }
-                            }
+                            cascade_played_to_series(
+                                db,
+                                user,
+                                &season,
+                                now,
+                                release_threshold,
+                            )
+                            .await?;
                         }
                     }
                 }
             }
 
             MediaKind::Season => {
-                let episode_ids = child_episode_ids(db, self.id).await;
+                let episode_ids =
+                    child_episode_ids(db, self.id, release_threshold).await;
                 bulk_mark_played(db, user.id, &episode_ids, now).await;
-
-                if let Some(series_id) = self.parent_id {
-                    let unplayed_seasons: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM media s \
-                         WHERE s.parent_id = ? AND s.kind = 'season' \
-                         AND NOT EXISTS (\
-                           SELECT 1 FROM user_media_state ums \
-                           WHERE ums.media_id = s.id \
-                           AND ums.user_id = ? \
-                           AND ums.play_count > 0\
-                         )",
-                    )
-                    .bind(series_id)
-                    .bind(user.id)
-                    .fetch_one(db)
-                    .await
-                    .unwrap_or(1);
-
-                    if unplayed_seasons == 0 {
-                        if let Ok(Some(series)) = Self::get_by_id(db, &series_id).await
-                        {
-                            series
-                                .apply_played(db, user, now)
-                                .await?;
-                        }
-                    }
-                }
+                cascade_played_to_series(db, user, self, now, release_threshold)
+                    .await?;
             }
 
             MediaKind::Series => {
-                let season_ids = child_season_ids(db, self.id).await;
+                let season_ids = child_season_ids(db, self.id, release_threshold).await;
                 bulk_mark_played(db, user.id, &season_ids, now).await;
-                let episode_ids = grandchild_episode_ids(db, self.id).await;
+                let episode_ids =
+                    grandchild_episode_ids(db, self.id, release_threshold).await;
                 bulk_mark_played(db, user.id, &episode_ids, now).await;
             }
 
-            _ => {} // other kinds: no propagation
+            _ => {}
         }
 
         Ok(state)
@@ -4465,55 +4617,24 @@ impl Media {
 
         match self.kind {
             MediaKind::Episode => {
-                if let Some(season_id) = self.parent_id {
-                    if let Ok(Some(season)) = Self::get_by_id(db, &season_id).await {
-                        let ss = super::UserMediaState::get_or_new(db, user, &season)
-                            .await?;
-                        if ss.play_count > 0 {
-                            season
-                                .apply_unplayed(db, user)
-                                .await?;
-                        }
-                    }
-                }
-                if let Some(series_id) = self.grandparent_id {
-                    if let Ok(Some(series)) = Self::get_by_id(db, &series_id).await {
-                        let ss = super::UserMediaState::get_or_new(db, user, &series)
-                            .await?;
-                        if ss.play_count > 0 {
-                            series
-                                .apply_unplayed(db, user)
-                                .await?;
-                        }
-                    }
-                }
+                unplay_parent_if_played(db, user, self.parent_id).await?;
+                unplay_parent_if_played(db, user, self.grandparent_id).await?;
             }
 
             MediaKind::Season => {
-                let episode_ids = child_episode_ids(db, self.id).await;
+                let episode_ids = child_episode_ids(db, self.id, None).await;
                 bulk_mark_unplayed(db, user.id, &episode_ids).await;
-
-                if let Some(series_id) = self.parent_id {
-                    if let Ok(Some(series)) = Self::get_by_id(db, &series_id).await {
-                        let ss = super::UserMediaState::get_or_new(db, user, &series)
-                            .await?;
-                        if ss.play_count > 0 {
-                            series
-                                .apply_unplayed(db, user)
-                                .await?;
-                        }
-                    }
-                }
+                unplay_parent_if_played(db, user, self.parent_id).await?;
             }
 
             MediaKind::Series => {
-                let season_ids = child_season_ids(db, self.id).await;
+                let season_ids = child_season_ids(db, self.id, None).await;
                 bulk_mark_unplayed(db, user.id, &season_ids).await;
-                let episode_ids = grandchild_episode_ids(db, self.id).await;
+                let episode_ids = grandchild_episode_ids(db, self.id, None).await;
                 bulk_mark_unplayed(db, user.id, &episode_ids).await;
             }
 
-            _ => {} // other kinds: no propagation
+            _ => {}
         }
 
         Ok(state)
@@ -4717,30 +4838,167 @@ impl Media {
     }
 }
 
-async fn child_episode_ids(db: &SqlitePool, parent_id: Uuid) -> Vec<Uuid> {
-    sqlx::query_scalar("SELECT id FROM media WHERE parent_id = ? AND kind = 'episode'")
-        .bind(parent_id)
+async fn count_unplayed_children(
+    db: &SqlitePool,
+    parent_id: Uuid,
+    kind: MediaKind,
+    user_id: Uuid,
+    threshold: Option<chrono::NaiveDateTime>,
+) -> i64 {
+    let mut qb =
+        sqlx::QueryBuilder::new("SELECT COUNT(*) FROM media WHERE parent_id = ");
+    qb.push_bind(parent_id);
+    qb.push(" AND kind = ");
+    qb.push_bind(kind.to_string());
+    qb.push(
+        " AND NOT EXISTS (\
+           SELECT 1 FROM user_media_state ums \
+           WHERE ums.media_id = media.id \
+           AND ums.user_id = ",
+    );
+    qb.push_bind(user_id);
+    qb.push(" AND ums.play_count > 0)");
+    if let Some(t) = threshold {
+        push_release_date_filter(&mut qb, "media", t, true);
+    }
+    qb.build_query_scalar()
+        .fetch_one(db)
+        .await
+        .unwrap_or(1)
+}
+
+async fn cascade_played_to_series(
+    db: &SqlitePool,
+    user: &super::User,
+    season: &Media,
+    now: chrono::NaiveDateTime,
+    release_threshold: Option<chrono::NaiveDateTime>,
+) -> anyhow::Result<()> {
+    if let Some(series_id) = season.parent_id {
+        let unplayed =
+            count_unplayed_released_seasons(db, series_id, user.id, release_threshold)
+                .await;
+        if unplayed == 0 {
+            if let Ok(Some(series)) = Media::get_by_id(db, &series_id).await {
+                series
+                    .apply_played(db, user, now)
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Count seasons under `series_id` that are unplayed.
+/// When `threshold` is Some, only seasons with at least one released episode are
+/// counted — seasons where all episodes are unreleased (upcoming seasons) are excluded
+/// so they don't block cascading to the series.
+async fn count_unplayed_released_seasons(
+    db: &SqlitePool,
+    series_id: Uuid,
+    user_id: Uuid,
+    threshold: Option<chrono::NaiveDateTime>,
+) -> i64 {
+    let mut qb =
+        sqlx::QueryBuilder::new("SELECT COUNT(*) FROM media s WHERE s.parent_id = ");
+    qb.push_bind(series_id);
+    qb.push(" AND s.kind = 'season'");
+    qb.push(
+        " AND NOT EXISTS (\
+           SELECT 1 FROM user_media_state ums \
+           WHERE ums.media_id = s.id AND ums.user_id = ",
+    );
+    qb.push_bind(user_id);
+    qb.push(" AND ums.play_count > 0)");
+    if let Some(t) = threshold {
+        qb.push(
+            " AND EXISTS (\
+               SELECT 1 FROM media e WHERE e.parent_id = s.id AND e.kind = 'episode'",
+        );
+        push_release_date_filter(&mut qb, "e", t, true);
+        qb.push(")");
+    }
+    qb.build_query_scalar()
+        .fetch_one(db)
+        .await
+        .unwrap_or(1)
+}
+
+async fn unplay_parent_if_played(
+    db: &SqlitePool,
+    user: &super::User,
+    parent_id: Option<Uuid>,
+) -> anyhow::Result<()> {
+    let Some(id) = parent_id else {
+        return Ok(());
+    };
+    if let Ok(Some(parent)) = Media::get_by_id(db, &id).await {
+        let ss = super::UserMediaState::get_or_new(db, user, &parent).await?;
+        if ss.play_count > 0 {
+            parent
+                .apply_unplayed(db, user)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn child_episode_ids(
+    db: &SqlitePool,
+    parent_id: Uuid,
+    threshold: Option<chrono::NaiveDateTime>,
+) -> Vec<Uuid> {
+    let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE parent_id = ");
+    qb.push_bind(parent_id);
+    qb.push(" AND kind = 'episode'");
+    if let Some(t) = threshold {
+        push_release_date_filter(&mut qb, "media", t, true);
+    }
+    qb.build_query_scalar()
         .fetch_all(db)
         .await
         .unwrap_or_default()
 }
 
-async fn child_season_ids(db: &SqlitePool, parent_id: Uuid) -> Vec<Uuid> {
-    sqlx::query_scalar("SELECT id FROM media WHERE parent_id = ? AND kind = 'season'")
-        .bind(parent_id)
+async fn child_season_ids(
+    db: &SqlitePool,
+    parent_id: Uuid,
+    threshold: Option<chrono::NaiveDateTime>,
+) -> Vec<Uuid> {
+    let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE parent_id = ");
+    qb.push_bind(parent_id);
+    qb.push(" AND kind = 'season'");
+    if let Some(t) = threshold {
+        // Only seasons that have at least one released episode.
+        qb.push(
+            " AND EXISTS (\
+               SELECT 1 FROM media e WHERE e.parent_id = media.id AND e.kind = 'episode'",
+        );
+        push_release_date_filter(&mut qb, "e", t, true);
+        qb.push(")");
+    }
+    qb.build_query_scalar()
         .fetch_all(db)
         .await
         .unwrap_or_default()
 }
 
-async fn grandchild_episode_ids(db: &SqlitePool, grandparent_id: Uuid) -> Vec<Uuid> {
-    sqlx::query_scalar(
-        "SELECT id FROM media WHERE grandparent_id = ? AND kind = 'episode'",
-    )
-    .bind(grandparent_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default()
+async fn grandchild_episode_ids(
+    db: &SqlitePool,
+    grandparent_id: Uuid,
+    threshold: Option<chrono::NaiveDateTime>,
+) -> Vec<Uuid> {
+    let mut qb =
+        sqlx::QueryBuilder::new("SELECT id FROM media WHERE grandparent_id = ");
+    qb.push_bind(grandparent_id);
+    qb.push(" AND kind = 'episode'");
+    if let Some(t) = threshold {
+        push_release_date_filter(&mut qb, "media", t, true);
+    }
+    qb.build_query_scalar()
+        .fetch_all(db)
+        .await
+        .unwrap_or_default()
 }
 
 /// Bulk-upsert `user_media_state` rows for `media_ids` as played (play_count = 1, played_at = `now`).
@@ -4837,28 +5095,44 @@ async fn bulk_mark_unplayed(db: &SqlitePool, user_id: Uuid, media_ids: &[Uuid]) 
 }
 
 /// After importing episodes for a series, ensure users who had the series marked played
-/// still have a consistent state. If new episodes exist that aren't yet played, clear the
-/// played flag on the series (and any affected seasons) for those users.
+/// still have a consistent state. If new (released) episodes exist that aren't yet played,
+/// clear the played flag on the series (and any affected seasons) for those users.
+/// Unreleased episodes are excluded from the staleness check — they should not cause the
+/// series to be unmarked when the user has watched everything available.
 pub async fn reconcile_series_played_state(db: &SqlitePool, series_id: Uuid) {
-    // Users who have the series played but have at least one unplayed episode.
-    let stale_users: Vec<Uuid> = sqlx::query_scalar(
+    let threshold = super::Settings::get_config_or_default(db)
+        .await
+        .release_date_threshold();
+
+    // Users who have the series played but have at least one unplayed released episode.
+    let mut qb = sqlx::QueryBuilder::new(
         "SELECT ums.user_id \
          FROM user_media_state ums \
-         WHERE ums.media_id = ? AND ums.play_count > 0 \
+         WHERE ums.media_id = ",
+    );
+    qb.push_bind(series_id);
+    qb.push(
+        " AND ums.play_count > 0 \
          AND EXISTS (\
            SELECT 1 FROM media e \
-           WHERE e.grandparent_id = ? AND e.kind = 'episode' \
-           AND NOT EXISTS (\
-             SELECT 1 FROM user_media_state u2 \
-             WHERE u2.media_id = e.id AND u2.user_id = ums.user_id AND u2.play_count > 0\
-           )\
-         )",
-    )
-    .bind(series_id)
-    .bind(series_id)
-    .fetch_all(db)
-    .await
-    .unwrap_or_default();
+           WHERE e.grandparent_id = ",
+    );
+    qb.push_bind(series_id);
+    qb.push(" AND e.kind = 'episode'");
+    if let Some(t) = threshold {
+        push_release_date_filter(&mut qb, "e", t, true);
+    }
+    qb.push(
+        " AND NOT EXISTS (\
+           SELECT 1 FROM user_media_state u2 \
+           WHERE u2.media_id = e.id AND u2.user_id = ums.user_id AND u2.play_count > 0\
+         ))",
+    );
+    let stale_users: Vec<Uuid> = qb
+        .build_query_scalar()
+        .fetch_all(db)
+        .await
+        .unwrap_or_default();
 
     for user_id in stale_users {
         // Unmark the series.
@@ -4872,28 +5146,41 @@ pub async fn reconcile_series_played_state(db: &SqlitePool, series_id: Uuid) {
         .await
         .ok();
 
-        // Unmark any seasons that are played but contain unplayed episodes.
-        let stale_seasons: Vec<Uuid> = sqlx::query_scalar(
+        // Unmark any seasons that are played but contain unplayed released episodes.
+        let mut qb = sqlx::QueryBuilder::new(
             "SELECT s.id FROM media s \
-             WHERE s.parent_id = ? AND s.kind = 'season' \
+             WHERE s.parent_id = ",
+        );
+        qb.push_bind(series_id);
+        qb.push(
+            " AND s.kind = 'season' \
              AND EXISTS (\
-               SELECT 1 FROM user_media_state ums WHERE ums.media_id = s.id \
-               AND ums.user_id = ? AND ums.play_count > 0\
+               SELECT 1 FROM user_media_state ums \
+               WHERE ums.media_id = s.id AND ums.user_id = ",
+        );
+        qb.push_bind(user_id);
+        qb.push(
+            " AND ums.play_count > 0\
              ) \
              AND EXISTS (\
-               SELECT 1 FROM media e WHERE e.parent_id = s.id AND e.kind = 'episode' \
-               AND NOT EXISTS (\
-                 SELECT 1 FROM user_media_state u2 \
-                 WHERE u2.media_id = e.id AND u2.user_id = ? AND u2.play_count > 0\
-               )\
-             )",
-        )
-        .bind(series_id)
-        .bind(user_id)
-        .bind(user_id)
-        .fetch_all(db)
-        .await
-        .unwrap_or_default();
+               SELECT 1 FROM media e \
+               WHERE e.parent_id = s.id AND e.kind = 'episode'",
+        );
+        if let Some(t) = threshold {
+            push_release_date_filter(&mut qb, "e", t, true);
+        }
+        qb.push(
+            " AND NOT EXISTS (\
+               SELECT 1 FROM user_media_state u2 \
+               WHERE u2.media_id = e.id AND u2.user_id = ",
+        );
+        qb.push_bind(user_id);
+        qb.push(" AND u2.play_count > 0))");
+        let stale_seasons: Vec<Uuid> = qb
+            .build_query_scalar()
+            .fetch_all(db)
+            .await
+            .unwrap_or_default();
 
         for season_id in stale_seasons {
             sqlx::query(
@@ -5414,6 +5701,57 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
     Ok(media_instances)
 }
 
+/// Return the release-date WHERE fragment for use in raw `format!` SQL strings.
+/// Push the release-date WHERE condition onto a query builder, binding `threshold`.
+///
+/// `alias` is the table alias for the media row (e.g. `"media"` for an unaliased
+/// table, `"e"` when episodes are selected as `media e`).
+///
+/// Appends a WHERE condition that hides items whose resolved release date is after `threshold`.
+///
+/// Resolution priority (CASE expression):
+/// 1. `digital_released_at` — explicit digital/streaming date; used as-is.
+/// 2. `released_at` within the past year → NULL (hidden). A recent theatrical release
+///    with no digital date confirmed is still considered unreleased digitally.
+/// 3. ELSE — depends on `use_parent_fallback`:
+///    - `true`  (episodes, series, movies): fall back to the parent row's dates via a
+///      correlated subquery. This lets undated episodes of old series (e.g. a 1990s
+///      show imported from Jellyfin with no per-episode air dates) inherit the series
+///      premiere and be treated as released rather than silently disappearing.
+///    - `false` (seasons): no parent fallback. A season with no own dates returns NULL
+///      from the CASE, which fails `<= threshold` and is hidden. This is intentional:
+///      TVDB often lists upcoming seasons before scheduling them, and we must not let
+///      such a season inherit the series' past premiere date and slip through the filter.
+///
+/// In all cases a NULL result from the CASE is falsy in SQLite (`NULL <= x` = NULL),
+/// so items that cannot resolve any date are excluded.
+pub fn push_release_date_filter(
+    qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
+    alias: &str,
+    threshold: NaiveDateTime,
+    use_parent_fallback: bool,
+) {
+    let a = format!("{alias}.");
+    let else_expr = if use_parent_fallback {
+        format!(
+            "COALESCE(\
+              {a}released_at, \
+              (SELECT COALESCE(p.digital_released_at, p.released_at) FROM media p WHERE p.id = {a}parent_id)\
+            )"
+        )
+    } else {
+        format!("{a}released_at")
+    };
+    qb.push(format!(
+        " AND CASE \
+            WHEN {a}digital_released_at IS NOT NULL THEN {a}digital_released_at \
+            WHEN {a}released_at IS NOT NULL AND datetime({a}released_at) > datetime('now', '-1 year') THEN NULL \
+            ELSE {else_expr} \
+          END <= "
+    ))
+    .push_bind(threshold);
+}
+
 /// Append WHERE clauses for a set of `FilterRule`s onto a query builder.
 ///
 /// Called once for both the count and records builders inside `get_by_filter`.
@@ -5426,44 +5764,61 @@ pub fn stremio_meta_to_medias(meta: sdks::stremio::Meta) -> Result<Vec<Media>> {
 /// - `has_trailer` — json_array_length check
 pub fn apply_filter_rules(
     qb: &mut sqlx::QueryBuilder<sqlx::Sqlite>,
-    rules: &[remux_sdks::remux::FilterRule],
-    match_mode: &remux_sdks::remux::FilterMatchMode,
+    filter: &remux_sdks::remux::CollectionFilter,
 ) {
     use remux_sdks::remux::FilterMatchMode;
 
-    if rules.is_empty() {
+    let non_empty: Vec<_> = filter
+        .groups
+        .iter()
+        .filter(|g| {
+            !g.rules
+                .is_empty()
+        })
+        .collect();
+
+    if non_empty.is_empty() {
         return;
     }
 
-    let is_any = *match_mode == FilterMatchMode::Any;
-    if is_any {
-        qb.push(" AND (");
-    }
+    let group_sep = match filter.match_mode {
+        FilterMatchMode::All => " AND ",
+        FilterMatchMode::Any => " OR ",
+    };
 
-    let mut first = true;
-    for rule in rules {
-        if let Some((sql, negated)) = filter_rule_to_sql(rule) {
-            if is_any {
-                if !first {
-                    qb.push(" OR ");
+    qb.push(" AND (");
+    let mut first_group = true;
+    for group in non_empty {
+        if !first_group {
+            qb.push(group_sep);
+        }
+        first_group = false;
+
+        let rule_sep = match group.match_mode {
+            FilterMatchMode::All => " AND ",
+            FilterMatchMode::Any => " OR ",
+        };
+
+        qb.push("(");
+        let mut first_rule = true;
+        for rule in &group.rules {
+            if let Some((sql, negated)) = filter_rule_to_sql(rule) {
+                if !first_rule {
+                    qb.push(rule_sep);
                 }
-            } else {
-                qb.push(" AND ");
-            }
-            first = false;
-            if negated {
-                qb.push("NOT (");
-            }
-            qb.push(sql);
-            if negated {
-                qb.push(")");
+                first_rule = false;
+                if negated {
+                    qb.push("NOT (");
+                }
+                qb.push(sql);
+                if negated {
+                    qb.push(")");
+                }
             }
         }
-    }
-
-    if is_any && !first {
         qb.push(")");
     }
+    qb.push(")");
 }
 
 /// Translate one `FilterRule` into a raw SQL fragment.
@@ -5563,11 +5918,36 @@ fn filter_rule_to_sql(rule: &remux_sdks::remux::FilterRule) -> Option<(String, b
                         .first()
                         .map(|s| s.as_str())
                         .unwrap_or(""));
-                    format!("lower(country) = lower('{v}')")
+                    format!(
+                        "media.id IN (SELECT mr.left_media_id FROM media_relations mr \
+                         WHERE mr.right_media_id IN \
+                         (SELECT id FROM media WHERE kind = 'country' AND lower(title) = lower('{v}')))"
+                    )
                 }
                 SetOp::In | SetOp::NotIn => {
                     let list = in_list(values)?;
-                    format!("lower(country) IN ({list})")
+                    format!(
+                        "media.id IN (SELECT mr.left_media_id FROM media_relations mr \
+                         WHERE mr.right_media_id IN \
+                         (SELECT id FROM media WHERE kind = 'country' AND lower(title) IN ({list})))"
+                    )
+                }
+            };
+            Some((sql, negated))
+        }
+        R::OriginalLanguage { op, values } => {
+            let negated = matches!(op, SetOp::IsNot | SetOp::NotIn);
+            let sql = match op {
+                SetOp::Is | SetOp::IsNot => {
+                    let v = esc(values
+                        .first()
+                        .map(|s| s.as_str())
+                        .unwrap_or(""));
+                    format!("lower(original_language) = lower('{v}')")
+                }
+                SetOp::In | SetOp::NotIn => {
+                    let list = in_list(values)?;
+                    format!("lower(original_language) IN ({list})")
                 }
             };
             Some((sql, negated))
@@ -5676,16 +6056,21 @@ fn filter_rule_to_sql(rule: &remux_sdks::remux::FilterRule) -> Option<(String, b
             };
             Some((sql, negated))
         }
-        R::Catalog { catalog_id } => {
-            let cid_hex = catalog_id
-                .simple()
-                .to_string();
+        R::Catalog { op, catalog_ids } if !catalog_ids.is_empty() => {
+            let in_clause = catalog_ids
+                .iter()
+                .map(|id| format!("X'{}'", id.simple()))
+                .collect::<Vec<_>>()
+                .join(", ");
             let sql = format!(
                 "EXISTS (SELECT 1 FROM media_relations mr \
-                 WHERE mr.right_media_id = media.id AND mr.role = 'catalog' AND mr.left_media_id = X'{cid_hex}')"
+                 WHERE mr.right_media_id = media.id AND mr.role = 'catalog' \
+                 AND mr.left_media_id IN ({in_clause}))"
             );
-            Some((sql, false))
+            let negated = matches!(op, SetOp::IsNot | SetOp::NotIn);
+            Some((sql, negated))
         }
+        R::Catalog { .. } => None,
     }
 }
 
@@ -5753,6 +6138,84 @@ fn build_episode_relations_from_ep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::MediaIdRaw;
+
+    #[test]
+    fn stale_episode_id_recomputes_to_canonical_and_validates() {
+        let series_imdb = NonEmptyString::try_new("tt1844624".to_string()).unwrap();
+        let mut ep = Media {
+            kind: MediaKind::Episode,
+            title: "S0E1 - Behind the Fright".to_string(),
+            idx: Some(1),
+            parent_idx: Some(0),
+            external_ids: ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            id: crate::common::stable_media_uuid(&MediaKind::Episode, "tt1844624:1:1"),
+            ..Default::default()
+        };
+
+        assert!(
+            ep.validate()
+                .is_err()
+        );
+
+        let raw = ep.media_id_raw();
+        assert!(
+            raw.canonical()
+                .is_some()
+        );
+        ep.id = Uuid::from(&raw);
+
+        assert_eq!(
+            ep.id,
+            crate::common::stable_media_uuid(&MediaKind::Episode, "tt1844624:0:1")
+        );
+        assert!(
+            ep.validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn stale_season_id_recomputes_to_canonical_and_validates() {
+        let series_imdb = NonEmptyString::try_new("tt1844624".to_string()).unwrap();
+        let mut season = Media {
+            kind: MediaKind::Season,
+            title: "Specials".to_string(),
+            idx: Some(0),
+            external_ids: ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            id: crate::common::stable_media_uuid(&MediaKind::Season, "tt1844624:1"),
+            ..Default::default()
+        };
+
+        assert!(
+            season
+                .validate()
+                .is_err()
+        );
+
+        let raw = season.media_id_raw();
+        assert!(
+            raw.canonical()
+                .is_some()
+        );
+        season.id = Uuid::from(&raw);
+
+        assert_eq!(
+            season.id,
+            crate::common::stable_media_uuid(&MediaKind::Season, "tt1844624:0")
+        );
+        assert!(
+            season
+                .validate()
+                .is_ok()
+        );
+    }
 
     #[test]
     fn from_path_tmdb_in_directory() {
@@ -5829,5 +6292,166 @@ mod tests {
         // directory has [tmdbid-603], filename repeats with a different id — first wins
         let ids = ExternalIds::from_path("[tmdbid-603]/[tmdbid-999].mkv");
         assert_eq!(ids.tmdb, Some(603));
+    }
+
+    #[test]
+    fn from_path_tvdb_black_summoner() {
+        let ids = ExternalIds::from_path(
+            "Black Summoner (2022) [tvdbid-416588]/Season 01/Black.Summoner.S01E01.mkv",
+        );
+        assert_eq!(ids.tvdb, Some(416588));
+        assert!(
+            ids.imdb
+                .is_none()
+        );
+        assert!(
+            ids.tmdb
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn from_path_tvdb_bleach() {
+        let ids = ExternalIds::from_path(
+            "Bleach (2004) [tvdbid-74796]/Season 01/Bleach.S01E01.mkv",
+        );
+        assert_eq!(ids.tvdb, Some(74796));
+        assert!(
+            ids.imdb
+                .is_none()
+        );
+        assert!(
+            ids.tmdb
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn from_path_tvdb_blood_c() {
+        let ids = ExternalIds::from_path(
+            "Blood-C (2011) [tvdbid-249864]/Season 01/Blood-C.S01E01.mkv",
+        );
+        assert_eq!(ids.tvdb, Some(249864));
+        assert!(
+            ids.imdb
+                .is_none()
+        );
+        assert!(
+            ids.tmdb
+                .is_none()
+        );
+    }
+
+    /// Verifies push_release_date_filter hides movies with a recent theatrical date
+    /// but no digital release date, while still showing movies with an old theatrical
+    /// date (>1 year) or an explicit digital release date.
+    #[tokio::test]
+    async fn release_date_filter_hides_recent_theatrical_only_movies() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = &guard
+            .0
+            .db;
+        let now = chrono::Utc::now().naive_utc();
+
+        let make_movie_ids = |imdb: &str| {
+            let ext = ExternalIds {
+                imdb: Some(NonEmptyString::try_new(imdb.to_string()).unwrap()),
+                ..Default::default()
+            };
+            let id = uuid::Uuid::from(&MediaIdRaw {
+                kind: MediaKind::Movie,
+                external_ids: ext.clone(),
+                season: None,
+                episode: None,
+            });
+            (id, ext)
+        };
+
+        let (id_recent, ext_recent) = make_movie_ids("tt9990001");
+        let (id_old, ext_old) = make_movie_ids("tt9990002");
+        let (id_digital, ext_digital) = make_movie_ids("tt9990003");
+
+        // Theatrical only, released 2 months ago — no digital date → must be hidden.
+        let mut recent_theatrical = Media {
+            id: id_recent,
+            title: "Recent Theatrical Only".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext_recent,
+            released_at: Some(now - chrono::Duration::days(60)),
+            digital_released_at: None,
+            ..Default::default()
+        };
+        recent_theatrical
+            .save(db)
+            .await
+            .unwrap();
+
+        // Theatrical only, released 2 years ago — no digital date → old enough, must be shown.
+        let mut old_theatrical = Media {
+            id: id_old,
+            title: "Old Theatrical Only".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext_old,
+            released_at: Some(now - chrono::Duration::days(730)),
+            digital_released_at: None,
+            ..Default::default()
+        };
+        old_theatrical
+            .save(db)
+            .await
+            .unwrap();
+
+        // Has explicit digital release date yesterday → must be shown.
+        let mut has_digital = Media {
+            id: id_digital,
+            title: "Has Digital Release".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext_digital,
+            released_at: None,
+            digital_released_at: Some(now - chrono::Duration::days(1)),
+            ..Default::default()
+        };
+        has_digital
+            .save(db)
+            .await
+            .unwrap();
+
+        let result = Media::get_by_filter(
+            db,
+            &MediaFilter {
+                kind: Some(vec![MediaKind::Movie]),
+                digital_released_before: Some(now),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let titles: Vec<&str> = result
+            .records
+            .iter()
+            .map(|m| {
+                m.title
+                    .as_str()
+            })
+            .collect();
+
+        assert!(
+            !titles.contains(&"Recent Theatrical Only"),
+            "recent theatrical-only movie must be hidden; got: {:?}",
+            titles
+        );
+        assert!(
+            titles.contains(&"Old Theatrical Only"),
+            "old theatrical-only movie must be shown; got: {:?}",
+            titles
+        );
+        assert!(
+            titles.contains(&"Has Digital Release"),
+            "movie with digital release date must be shown; got: {:?}",
+            titles
+        );
     }
 }

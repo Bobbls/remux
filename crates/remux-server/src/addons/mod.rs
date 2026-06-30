@@ -13,6 +13,7 @@ pub mod squid;
 pub mod stremio;
 pub mod tmdb;
 pub mod torznab;
+pub mod trakt;
 pub mod ytdlp;
 
 use anyhow::{Result, anyhow};
@@ -199,6 +200,103 @@ pub(crate) async fn save_pending_relations(ctx: &AppContext, items: &[db::Media]
     }
 }
 
+/// Persist `provider:` tags collected from meta addons. Only `provider:`-prefixed
+/// tags are touched — user-set tags with other prefixes are left intact.
+pub(crate) async fn save_pending_tags(ctx: &AppContext, items: &[db::Media]) {
+    for item in items {
+        let provider_tags: Vec<&String> = item
+            .tags
+            .iter()
+            .filter(|t| t.starts_with("provider:"))
+            .collect();
+        if provider_tags.is_empty() {
+            continue;
+        }
+        if let Err(e) = sqlx::query(
+            "DELETE FROM media_tags WHERE media_id = ? AND tag LIKE 'provider:%'",
+        )
+        .bind(item.id)
+        .execute(&ctx.db)
+        .await
+        {
+            warn!(id = %item.id, error = %e, "failed to clear provider tags");
+            continue;
+        }
+        for tag in provider_tags {
+            if let Err(e) = sqlx::query(
+                "INSERT OR IGNORE INTO media_tags (media_id, tag) VALUES (?, ?)",
+            )
+            .bind(item.id)
+            .bind(tag)
+            .execute(&ctx.db)
+            .await
+            {
+                warn!(id = %item.id, %tag, error = %e, "failed to insert provider tag");
+            }
+        }
+    }
+}
+
+pub(crate) async fn save_pending_popularity(ctx: &AppContext, items: &[db::Media]) {
+    let today = chrono::Utc::now().date_naive();
+    for item in items {
+        let Some((ref ext_id, value)) = item.pending_popularity else {
+            continue;
+        };
+        if let Err(e) = sqlx::query(
+            "INSERT INTO popularity_raw (source, external_id, media_id, media_raw, value, date) \
+             VALUES ('tmdb', ?, ?, ?, ?, ?) \
+             ON CONFLICT DO UPDATE SET value = excluded.value, \
+             media_id = COALESCE(excluded.media_id, popularity_raw.media_id), \
+             media_raw = COALESCE(excluded.media_raw, popularity_raw.media_raw)",
+        )
+        .bind(ext_id)
+        .bind(item.id)
+        .bind(ext_id)
+        .bind(value.get())
+        .bind(&today)
+        .execute(&ctx.db)
+        .await
+        {
+            warn!(id = %item.id, error = %e, "failed to write popularity_raw");
+        }
+    }
+}
+
+pub(crate) async fn bulk_insert_snapshots(
+    ctx: &AppContext,
+    snapshots: &[MetricSnapshot],
+) -> Result<()> {
+    if snapshots.is_empty() {
+        return Ok(());
+    }
+    for chunk in snapshots.chunks(400) {
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO popularity_raw (source, external_id, media_id, media_raw, value, date) ",
+        );
+        qb.push_values(chunk, |mut b, s| {
+            b.push_bind(&s.source)
+                .push_bind(&s.external_id)
+                .push_bind(s.media_id)
+                .push_bind(&s.media_raw)
+                .push_bind(
+                    s.value
+                        .get(),
+                )
+                .push_bind(&s.date);
+        });
+        qb.push(
+            " ON CONFLICT DO UPDATE SET value = excluded.value, \
+             media_id = COALESCE(excluded.media_id, popularity_raw.media_id), \
+             media_raw = COALESCE(excluded.media_raw, popularity_raw.media_raw)",
+        );
+        qb.build()
+            .execute(&ctx.db)
+            .await?;
+    }
+    Ok(())
+}
+
 pub(crate) fn merge_media(target: &mut db::Media, source: &db::Media, replace: bool) {
     use remux_utils::merge_option;
 
@@ -230,6 +328,11 @@ pub(crate) fn merge_media(target: &mut db::Media, source: &db::Media, replace: b
         replace,
     );
     merge_option(&mut target.country, &source.country, replace);
+    merge_option(
+        &mut target.original_language,
+        &source.original_language,
+        replace,
+    );
     merge_option(&mut target.trailers, &source.trailers, replace);
     merge_option(
         &mut target.digital_released_at,
@@ -289,6 +392,21 @@ fn apply_meta(media: &mut db::Media, mut patch: db::Media, replace: bool) {
         merge_vec(&mut imgs.backdrop, patch_images.backdrop, replace);
         merge_vec(&mut imgs.logo, patch_images.logo, replace);
         merge_vec(&mut imgs.thumb, patch_images.thumb, replace);
+    }
+
+    if !patch
+        .tags
+        .is_empty()
+    {
+        media
+            .tags
+            .extend(std::mem::take(&mut patch.tags));
+        media
+            .tags
+            .sort_unstable();
+        media
+            .tags
+            .dedup();
     }
 
     merge_media(media, &patch, replace);
@@ -480,6 +598,7 @@ pub trait SearchAddon: Send + Sync {
     ) -> Result<Option<Vec<db::Media>>>;
 }
 
+#[derive(Clone)]
 pub struct SubtitleInfo {
     pub id: String,
     pub url: Option<crate::stream::StreamDescriptor>,
@@ -542,6 +661,62 @@ pub trait LyricAddon: Send + Sync {
     async fn lyric_get_by_id(&self, id: &str) -> Result<Option<LyricDto>>;
 }
 
+/// A single popularity snapshot emitted by a `MetricsAddon`.
+/// Popularity score normalized to \[0.0, 100.0\].
+///
+/// All `MetricsAddon` implementations must emit values in this range.
+/// Use `MetricValue::from_raw(raw, source_max)` to normalize a raw source value.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct MetricValue(f64);
+
+impl MetricValue {
+    /// Normalize a raw source value: `(raw / source_max) * 100`, clamped to \[0, 100\].
+    pub fn from_raw(raw: f64, source_max: f64) -> Self {
+        Self(((raw / source_max) * 100.0).clamp(0.0, 100.0))
+    }
+
+    /// Construct from an already-normalized value, clamping to \[0, 100\].
+    pub fn from_normalized(v: f64) -> Self {
+        Self(v.clamp(0.0, 100.0))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+/// Each addon computes the `value` internally from its own source data.
+/// Values must be in \[0.0, 100.0\]; use `MetricValue::from_raw` to normalize.
+#[derive(Debug, Clone)]
+pub struct MetricSnapshot {
+    pub source: String,
+    pub external_id: String,
+    pub value: MetricValue,
+    pub date: chrono::NaiveDate,
+    pub media_id: Option<uuid::Uuid>,
+    pub media_raw: Option<String>,
+}
+
+/// Per-run context passed to `MetricsAddon::metric`. Carries only what addons
+/// need (static config + pre-fetched settings) — addons must not touch the DB.
+#[derive(Clone)]
+pub struct MetricsCtx {
+    pub config: Arc<crate::Config>,
+    pub settings: api::ServerConfiguration,
+}
+
+#[async_trait]
+pub trait MetricsAddon: AddonKind + Send + Sync {
+    /// Fetch a popularity metric for a single media item.
+    /// Returns `None` if this addon has no data for the item.
+    /// Values in `MetricSnapshot.value` must be in \[0.0, 100.0\].
+    async fn metric(
+        &self,
+        media: &db::Media,
+        ctx: &MetricsCtx,
+    ) -> Result<Option<MetricSnapshot>>;
+}
+
 // ---------------------------------------------------------------------------
 // AddonCapabilities — produced by AddonPreset::from_cfg
 // ---------------------------------------------------------------------------
@@ -559,6 +734,7 @@ pub struct AddonCapabilities {
     pub segment: Option<Arc<dyn SegmentAddon>>,
     pub lyric: Option<Arc<dyn LyricAddon>>,
     pub index: Option<Arc<dyn IndexAddon>>,
+    pub metrics: Option<Arc<dyn MetricsAddon>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -924,6 +1100,159 @@ impl AddonService {
             .collect()
     }
 
+    pub fn metrics_addons(&self) -> Vec<AddonRuntime> {
+        self.inner
+            .load()
+            .iter()
+            .filter(|r| {
+                r.metrics
+                    .is_some()
+                    && r.row
+                        .resources
+                        .contains(&ResourceType::Metrics)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub async fn snapshot_all_metrics(
+        &self,
+        ctx: &AppContext,
+        progress: ProgressReporter,
+    ) -> Result<()> {
+        use futures::stream::{self, StreamExt as _};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let addons = self.metrics_addons();
+        if addons.is_empty() {
+            progress.set(100.0);
+            return Ok(());
+        }
+
+        let settings = db::Settings::get_config_or_default(&ctx.db).await;
+        let metrics_ctx = MetricsCtx {
+            config: Arc::new(
+                ctx.config
+                    .clone(),
+            ),
+            settings,
+        };
+
+        let total: u64 = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM media WHERE kind IN ('movie', 'series')",
+        )
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap_or(0) as u64;
+
+        let num_addons = addons.len() as u64;
+        let grand_total = total * num_addons;
+        // Shared counter: done items + newly fetched items across all addon loops.
+        let processed = Arc::new(AtomicU64::new(0));
+
+        const PAGE: u32 = 250;
+        const CONCURRENCY: usize = 25;
+
+        // Each addon runs its own independent paging loop concurrently.
+        // This way a rate-limited addon (e.g. Trakt sleeping 5 min) doesn't
+        // stall the others.
+        futures::future::join_all(
+            addons
+                .iter()
+                .map(|runtime| {
+                    let addon = runtime.metrics.as_ref().unwrap().clone();
+                    let metrics_ctx = metrics_ctx.clone();
+                    let progress = progress.clone();
+                    let processed = Arc::clone(&processed);
+                    async move {
+                        let done: std::collections::HashSet<uuid::Uuid> =
+                            sqlx::query_scalar::<_, Option<uuid::Uuid>>(
+                                "SELECT media_id FROM popularity_raw \
+                                 WHERE source = ? AND date = date('now') AND media_id IS NOT NULL",
+                            )
+                            .bind(addon.id())
+                            .fetch_all(&ctx.db)
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .flatten()
+                            .collect();
+
+                        tracing::info!(
+                            source = addon.id(),
+                            already_fetched = done.len(),
+                            remaining = (total as usize).saturating_sub(done.len()),
+                            "starting metrics fetch"
+                        );
+
+                        // Credit already-fetched items immediately so progress
+                        // reflects a resumed or partial run from the start.
+                        if grand_total > 0 && !done.is_empty() {
+                            let n = processed.fetch_add(done.len() as u64, Ordering::Relaxed)
+                                + done.len() as u64;
+                            progress.set((n as f64 / grand_total as f64 * 100.0).min(99.0));
+                        }
+
+                        let mut offset = 0u32;
+                        loop {
+                            let page = db::Media::get_by_filter(
+                                &ctx.db,
+                                &db::MediaFilter {
+                                    kind: Some(vec![db::MediaKind::Movie, db::MediaKind::Series]),
+                                    limit: Some(PAGE),
+                                    offset: Some(offset),
+                                    total_count: false,
+                                    ..Default::default()
+                                },
+                            )
+                            .await?
+                            .records;
+
+                            if page.is_empty() {
+                                break;
+                            }
+
+                            let batch: Vec<_> =
+                                page.into_iter().filter(|m| !done.contains(&m.id)).collect();
+                            offset += PAGE;
+                            if batch.is_empty() {
+                                continue;
+                            }
+
+                            let batch_len = batch.len() as u64;
+                            let snapshots: Vec<MetricSnapshot> = stream::iter(batch)
+                                .map(|item| {
+                                    let addon = addon.clone();
+                                    let ctx = metrics_ctx.clone();
+                                    async move { addon.metric(&item, &ctx).await.ok().flatten() }
+                                })
+                                .buffer_unordered(CONCURRENCY)
+                                .filter_map(|s| async move { s })
+                                .collect()
+                                .await;
+
+                            if !snapshots.is_empty() {
+                                bulk_insert_snapshots(ctx, &snapshots).await?;
+                            }
+
+                            if grand_total > 0 {
+                                let n = processed.fetch_add(batch_len, Ordering::Relaxed)
+                                    + batch_len;
+                                progress.set((n as f64 / grand_total as f64 * 100.0).min(99.0));
+                            }
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }
+                }),
+        )
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+        progress.set(100.0);
+        Ok(())
+    }
+
     /// Returns `(addon, catalogs)` pairs for every catalog-capable addon that could
     /// produce any of `kinds`, with each addon's catalog list already filtered down to
     /// catalogs whose own `media_kind` is one of `kinds`. Addons are pre-filtered via
@@ -956,7 +1285,7 @@ impl AddonService {
                     .filter(|c| {
                         c.media_kind
                             .as_ref()
-                            .is_some_and(|mk| kinds.contains(mk))
+                            .is_some_and(|mk| kind_in_type_list(mk, kinds))
                     })
                     .collect(),
                 Err(e) => {
@@ -1148,6 +1477,25 @@ impl AddonService {
             }
         }
 
+        // Recompute stable UUID for Movie/Series/Season/Episode once the canonical external ID
+        // (IMDB or custom stremio) is resolved by meta enrichment. Catalog stubs
+        // arrive with a TMDB-keyed UUID; validate() expects the canonical one.
+        if matches!(
+            media.kind,
+            db::MediaKind::Movie
+                | db::MediaKind::Series
+                | db::MediaKind::Season
+                | db::MediaKind::Episode
+        ) {
+            let raw = media.media_id_raw();
+            if raw
+                .canonical()
+                .is_some()
+            {
+                media.id = uuid::Uuid::from(&raw);
+            }
+        }
+
         media.refreshed_at = Some(chrono::Utc::now().naive_utc());
         Ok(())
     }
@@ -1233,9 +1581,7 @@ impl AddonService {
     ) -> Result<()> {
         use futures::stream::{self, StreamExt};
 
-        let config = db::Settings::get_config(&ctx.db)
-            .await
-            .unwrap_or_default();
+        let config = db::Settings::get_config_or_default(&ctx.db).await;
 
         let concurrency = config.meta_concurrency as usize;
         let config = Arc::new(config);
@@ -1267,6 +1613,8 @@ impl AddonService {
                 match db::Media::upsert(&ctx.db, &items).await {
                     Ok(_) => {
                         save_pending_relations(ctx, &items).await;
+                        save_pending_tags(ctx, &items).await;
+                        save_pending_popularity(ctx, &items).await;
                         let series_ids: Vec<_> = items
                             .iter()
                             .filter(|item| item.kind == db::MediaKind::Series)
@@ -1290,6 +1638,8 @@ impl AddonService {
             match db::Media::upsert(&ctx.db, &batch).await {
                 Ok(_) => {
                     save_pending_relations(ctx, &batch).await;
+                    save_pending_tags(ctx, &batch).await;
+                    save_pending_popularity(ctx, &batch).await;
                     let series_ids: Vec<_> = batch
                         .iter()
                         .filter(|item| item.kind == db::MediaKind::Series)

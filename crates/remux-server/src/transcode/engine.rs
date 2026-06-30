@@ -12,7 +12,10 @@ use std::{
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use crate::common::{TickUnit, ToRunTimeTicks};
+use crate::{
+    common::{TickUnit, ToRunTimeTicks},
+    device_profile::{AudioCodec, VideoCodec},
+};
 use remux_sdks::remux::{EncodingPreset, HardwareAccelerationType, VideoRangeType};
 
 use super::session::{TranscodeSession, TranscodeState};
@@ -274,6 +277,9 @@ pub struct TranscodeParams {
     /// Codec of the source video stream (e.g. "hevc", "h264"), used to apply
     /// codec-specific output flags such as `-tag:v hvc1` for HEVC in HLS.
     pub source_video_codec: Option<String>,
+    /// Codec of the source audio stream (e.g. "aac", "ac3"), used to apply
+    /// codec-specific bitstream filters such as `aac_adtstoasc` when copying.
+    pub source_audio_codec: Option<String>,
     pub hardware_acceleration_type: HardwareAccelerationType,
     /// VAAPI render device path.
     pub vaapi_device: String,
@@ -325,6 +331,7 @@ impl Default for TranscodeParams {
             subtitle_height: None,
             encoding_preset: None,
             source_video_codec: None,
+            source_audio_codec: None,
             hardware_acceleration_type: HardwareAccelerationType::None,
             vaapi_device: "/dev/dri/renderD128".to_string(),
             vaapi_driver: String::new(),
@@ -583,12 +590,16 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     // fMP4 (fragmented MP4) is required for HEVC on iOS Safari per Apple's HLS
     // authoring specification.  MPEG-TS cannot carry HEVC correctly in HLS.
     let is_hevc_copy = ffmpeg_video_codec == "copy"
-        && matches!(
-            params
-                .source_video_codec
-                .as_deref(),
-            Some("hevc") | Some("h265") | Some("hvc1") | Some("hev1")
-        );
+        && params
+            .source_video_codec
+            .as_deref()
+            .and_then(|s| {
+                s.parse::<VideoCodec>()
+                    .ok()
+            })
+            .as_ref()
+            .map(VideoCodec::is_hevc)
+            .unwrap_or(false);
 
     let mut args: Vec<String> = vec![
         "-v".into(),
@@ -667,6 +678,7 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     // Stream mapping
     if params.burn_subtitle {
         if let Some(sub_idx) = params.subtitle_stream_index {
+            // Image subtitle (PGS/DVD): bitmap overlay via filter_complex.
             // Scale subtitle bitmap to output dimensions (matching Jellyfin's approach).
             // When output size is known, scale to that; otherwise pass through as-is.
             let (out_w, out_h) = output_dimensions(params);
@@ -806,10 +818,18 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
     if ffmpeg_video_codec == "copy" {
         if is_hevc_copy {
             args.extend(["-tag:v".into(), "hvc1".into()]);
-            // fMP4 stores HEVC in HVCC format natively — no hevc_mp4toannexb needed.
-            // Strip embedded Dolby Vision RPU NALs so VideoToolbox treats this as
-            // plain HDR10 rather than Dolby Vision (avoids black video on some devices).
-            args.extend(["-bsf:v".into(), "dovi_rpu=strip=1".into()]);
+            // Strip embedded Dolby Vision RPU NALs only when the source is actually DoVi;
+            // dovi_rpu only supports hevc/av1 and will crash ffmpeg on any other codec.
+            let is_dovi = matches!(
+                params.source_video_range_type,
+                Some(VideoRangeType::Dovi)
+                    | Some(VideoRangeType::DoviWithHdr10)
+                    | Some(VideoRangeType::DoviWithHlg)
+                    | Some(VideoRangeType::DoviWithSdr)
+            );
+            if is_dovi {
+                args.extend(["-bsf:v".into(), "dovi_rpu=strip=1".into()]);
+            }
         }
     } else if is_hw {
         // HW encoders use bitrate control; CRF/preset/profile flags don't apply.
@@ -873,7 +893,23 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
 
     // Audio codec
     args.extend(["-c:a".into(), ffmpeg_audio_codec.into()]);
-    if ffmpeg_audio_codec != "copy" {
+    if ffmpeg_audio_codec == "copy" {
+        // AAC streams from IPTV sources often use ADTS framing, which is not
+        // valid inside MP4/fMP4 containers. Apply the reframing filter when copying.
+        if params
+            .source_audio_codec
+            .as_deref()
+            .and_then(|s| {
+                s.parse::<AudioCodec>()
+                    .ok()
+            })
+            .as_ref()
+            .map(AudioCodec::needs_adts_reframe)
+            .unwrap_or(false)
+        {
+            args.extend(["-bsf:a".into(), "aac_adtstoasc".into()]);
+        }
+    } else {
         let audio_bitrate = params
             .audio_bitrate
             .unwrap_or(128_000);
@@ -1258,6 +1294,7 @@ pub struct ProgressiveTranscodeParams {
     pub subtitle_height: Option<u32>,
     pub encoding_preset: Option<EncodingPreset>,
     pub source_video_codec: Option<String>,
+    pub source_audio_codec: Option<String>,
     pub hardware_acceleration_type: HardwareAccelerationType,
     pub vaapi_device: String,
     /// VAAPI driver name (e.g. "iHD" for Intel). Empty string means auto-detect.
@@ -1420,6 +1457,7 @@ pub(crate) fn build_progressive_args(
 
     if params.burn_subtitle {
         if let Some(sub_idx) = params.subtitle_stream_index {
+            // Image subtitle (PGS/DVD): bitmap overlay via filter_complex.
             let (out_w, out_h) = (params.max_width, params.max_height);
             let sub_scale = match (out_w, out_h) {
                 (Some(w), Some(h)) => format!("scale={w}:{h}:fast_bilinear"),
@@ -1535,12 +1573,17 @@ pub(crate) fn build_progressive_args(
     args.extend(["-c:v".into(), ffmpeg_video_codec.clone()]);
     if ffmpeg_video_codec == "copy" {
         // Apply hvc1 codec tag for HEVC Apple compatibility
-        if matches!(
-            params
-                .source_video_codec
-                .as_deref(),
-            Some("hevc") | Some("h265") | Some("hvc1") | Some("hev1")
-        ) {
+        if params
+            .source_video_codec
+            .as_deref()
+            .and_then(|s| {
+                s.parse::<VideoCodec>()
+                    .ok()
+            })
+            .as_ref()
+            .map(VideoCodec::is_hevc)
+            .unwrap_or(false)
+        {
             args.extend(["-tag:v".into(), "hvc1".into()]);
         }
     } else if is_hw {
@@ -1601,7 +1644,21 @@ pub(crate) fn build_progressive_args(
 
     // Audio
     args.extend(["-c:a".into(), ffmpeg_audio_codec.into()]);
-    if ffmpeg_audio_codec != "copy" {
+    if ffmpeg_audio_codec == "copy" {
+        if params
+            .source_audio_codec
+            .as_deref()
+            .and_then(|s| {
+                s.parse::<AudioCodec>()
+                    .ok()
+            })
+            .as_ref()
+            .map(AudioCodec::needs_adts_reframe)
+            .unwrap_or(false)
+        {
+            args.extend(["-bsf:a".into(), "aac_adtstoasc".into()]);
+        }
+    } else {
         if let Some(bitrate) = params.audio_bitrate {
             args.extend(["-b:a".into(), bitrate.to_string()]);
         }
@@ -1708,6 +1765,7 @@ pub fn generate_variant_playlist(
     let runtime_ticks = session.runtime_ticks;
     let segment_length = session.segment_length;
     let play_session_id = &session.id;
+    let start_time_secs = session.start_time_secs;
     let use_fmp4 = session.use_fmp4();
     // fMP4 segments require HLS version 7; standard TS segments need version 6.
     let version = if use_fmp4 { 7u32 } else { 6u32 };
@@ -1763,6 +1821,12 @@ pub fn generate_variant_playlist(
     buf.push_str(&format!("#EXT-X-VERSION:{}\n", version));
     buf.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", target_duration));
     buf.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    if start_time_secs > 0 {
+        buf.push_str(&format!(
+            "#EXT-X-START:TIME-OFFSET={:.6},PRECISE=YES\n",
+            start_time_secs as f64
+        ));
+    }
     if use_fmp4 {
         buf.push_str(&format!(
             "#EXT-X-MAP:URI=\"init.mp4?PlaySessionId={}\"\n",
@@ -1823,20 +1887,28 @@ pub fn generate_master_playlist(session: &TranscodeSession) -> String {
         .video_codec
         .as_str()
     {
-        "copy" => match session
-            .source_video_codec
-            .as_deref()
-        {
-            Some("hevc") | Some("h265") | Some("hvc1") | Some("hev1") => {
+        "copy" => {
+            if session
+                .source_video_codec
+                .as_deref()
+                .and_then(|s| {
+                    s.parse::<VideoCodec>()
+                        .ok()
+                })
+                .as_ref()
+                .map(VideoCodec::is_hevc)
+                .unwrap_or(false)
+            {
                 hevc_hls_codec_string(
                     session
                         .source_video_profile
                         .as_deref(),
                     session.source_video_level,
                 )
+            } else {
+                "avc1.640028".to_string()
             }
-            _ => "avc1.640028".to_string(),
-        },
+        }
         "h264" | "libx264" => "avc1.640028".to_string(),
         "hevc" | "libx265" => hevc_hls_codec_string(
             session
@@ -1846,12 +1918,23 @@ pub fn generate_master_playlist(session: &TranscodeSession) -> String {
         ),
         _ => "avc1.640028".to_string(),
     };
-    let audio_codec_str = match session
-        .audio_codec
-        .as_str()
-    {
-        "copy" | "aac" => "mp4a.40.2",
-        _ => "mp4a.40.2",
+    let audio_codec_str = if session.audio_codec == "copy" {
+        // Use the actual source codec when copying so the CODECS attribute
+        // matches the bitstream. Browsers that see "mp4a.40.2" but receive
+        // eac3 will fail to initialize the audio decoder.
+        match session
+            .source_audio_codec
+            .as_deref()
+            .and_then(|s| {
+                s.parse::<AudioCodec>()
+                    .ok()
+            }) {
+            Some(AudioCodec::Eac3) => "ec-3",
+            Some(AudioCodec::Ac3) => "ac-3",
+            _ => "mp4a.40.2",
+        }
+    } else {
+        "mp4a.40.2"
     };
     let codecs = format!("{},{}", video_codec_str, audio_codec_str);
 
@@ -1912,7 +1995,9 @@ pub fn generate_master_playlist(session: &TranscodeSession) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use remux_sdks::remux::TranscodeReasons;
     use std::path::PathBuf;
+    use uuid::Uuid;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -2098,6 +2183,7 @@ mod tests {
             subtitle_height: None,
             encoding_preset: None,
             source_video_codec: None,
+            source_audio_codec: None,
             hardware_acceleration_type: HardwareAccelerationType::None,
             vaapi_device: "/dev/dri/renderD128".into(),
             vaapi_driver: String::new(),
@@ -2152,15 +2238,80 @@ mod tests {
             Some("init.mp4")
         );
         assert_eq!(arg_after(&args, "-tag:v"), Some("hvc1"));
-        // Dolby Vision strip bsf
+        // No DoVi range type → dovi_rpu must NOT be injected (would crash on non-HEVC/AV1)
         assert!(
-            args.windows(2)
+            !args
+                .windows(2)
                 .any(|w| w[0] == "-bsf:v" && w[1].contains("dovi_rpu"))
         );
         // Segments use .m4s extension
         assert!(
             args.iter()
                 .any(|a| a.contains("segment_") && a.ends_with(".m4s"))
+        );
+    }
+
+    #[test]
+    fn hls_hevc_dovi_copy_strips_rpu() {
+        let dir = PathBuf::from("/tmp/test_hevc_dovi");
+        let args = build_hls_args(&TranscodeParams {
+            video_codec: "copy".into(),
+            source_video_codec: Some("hevc".into()),
+            source_video_range_type: Some(VideoRangeType::DoviWithHdr10),
+            ..default_hls(dir)
+        });
+        assert_eq!(arg_after(&args, "-tag:v"), Some("hvc1"));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-bsf:v" && w[1].contains("dovi_rpu")),
+            "dovi_rpu bsf must be present for DoVi HEVC copy"
+        );
+    }
+
+    #[test]
+    fn hls_aac_copy_adds_adtstoasc() {
+        let dir = PathBuf::from("/tmp/test_aac_copy");
+        let args = build_hls_args(&TranscodeParams {
+            audio_codec: "copy".into(),
+            source_audio_codec: Some("aac".into()),
+            ..default_hls(dir)
+        });
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-bsf:a" && w[1] == "aac_adtstoasc"),
+            "aac_adtstoasc bsf must be present when copying AAC audio"
+        );
+    }
+
+    #[test]
+    fn hls_aac_transcode_no_adtstoasc() {
+        let dir = PathBuf::from("/tmp/test_aac_transcode");
+        let args = build_hls_args(&TranscodeParams {
+            audio_codec: "aac".into(),
+            source_audio_codec: Some("aac".into()),
+            ..default_hls(dir)
+        });
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "-bsf:a"),
+            "aac_adtstoasc must NOT be added when re-encoding audio"
+        );
+    }
+
+    #[test]
+    fn hls_non_aac_copy_no_adtstoasc() {
+        let dir = PathBuf::from("/tmp/test_ac3_copy");
+        let args = build_hls_args(&TranscodeParams {
+            audio_codec: "copy".into(),
+            source_audio_codec: Some("ac3".into()),
+            ..default_hls(dir)
+        });
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "-bsf:a"),
+            "aac_adtstoasc must NOT be added for non-AAC audio"
         );
     }
 
@@ -2240,6 +2391,50 @@ mod tests {
         let args = build_hls_args(&default_hls(dir));
         assert_eq!(arg_after(&args, "-start_number"), Some("0"));
         assert!(!args_contains(&args, "-ss"));
+    }
+
+    #[test]
+    fn resumed_vod_playlist_advertises_start_offset_and_full_seek_map() {
+        let session = TranscodeSession {
+            id: "play-session".into(),
+            item_id: Uuid::nil(),
+            media_source_id: Uuid::nil(),
+            output_dir: PathBuf::from("/tmp/test_playlist"),
+            input_url: "http://example.invalid/video".into(),
+            state: TranscodeState::Running,
+            state_tx: Arc::new(tokio::sync::watch::channel(TranscodeState::Running).0),
+            created_at: std::time::Instant::now(),
+            video_codec: "copy".into(),
+            audio_codec: "aac".into(),
+            audio_stream_index: None,
+            subtitle_stream_index: None,
+            burn_subtitle: false,
+            segment_length: 6,
+            transcode_reasons: TranscodeReasons::default(),
+            kill_tx: None,
+            wait_done: Arc::new(tokio::sync::Notify::new()),
+            last_segment_index: Arc::new(AtomicU32::new(0)),
+            start_time_secs: 30,
+            playback_offset_secs: Arc::new(AtomicU32::new(0)),
+            runtime_ticks: 120i64
+                .to_ticks(TickUnit::Seconds)
+                .unwrap(),
+            is_live: false,
+            source_video_codec: Some("h264".into()),
+            source_audio_codec: Some("aac".into()),
+            source_video_profile: None,
+            source_video_level: None,
+            source_video_range_type: None,
+            source_video_width: None,
+            source_video_height: None,
+            source_frame_rate: None,
+        };
+
+        let playlist = generate_variant_playlist(&session, "");
+
+        assert!(playlist.contains("#EXT-X-START:TIME-OFFSET=30.000000,PRECISE=YES"));
+        assert!(playlist.contains("segment_00000.ts?PlaySessionId=play-session&runtimeTicks=0&actualSegmentLengthTicks=60000000"));
+        assert!(playlist.contains("segment_00005.ts?PlaySessionId=play-session&runtimeTicks=300000000&actualSegmentLengthTicks=60000000"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub trait IdSetter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindByIdEndpoint {
+    #[serde(skip)]
     pub external_id: String,
     pub external_source: String,
 }
@@ -30,12 +31,8 @@ impl Endpoint for FindByIdEndpoint {
         format!("find/{}", self.external_id)
     }
 
-    fn query(&self) -> Vec<(String, String)> {
-        vec![(
-            "external_source".to_string(),
-            self.external_source
-                .clone(),
-        )]
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        self
     }
 }
 
@@ -237,7 +234,7 @@ pub struct Network {
     pub origin_country: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProductionCompany {
     pub id: u64,
     pub logo_path: Option<String>,
@@ -245,7 +242,7 @@ pub struct ProductionCompany {
     pub origin_country: String,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ProductionCountry {
     pub iso_3166_1: String,
     pub name: String,
@@ -267,7 +264,7 @@ pub struct PaginatedResponse<T> {
     pub total_results: u32,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct DiscoverQuery {
     // Common parameters
     pub language: Option<String>,
@@ -290,6 +287,10 @@ pub struct DiscoverQuery {
     pub with_networks: Option<String>,
     pub with_companies: Option<String>,
     pub with_origin_country: Option<String>,
+    #[serde(rename = "vote_count.gte")]
+    pub vote_count_gte: Option<u32>,
+    #[serde(rename = "vote_average.gte")]
+    pub vote_average_gte: Option<f32>,
 
     // Movie-specific parameters
     pub region: Option<String>,
@@ -360,12 +361,8 @@ impl Endpoint for PersonSearchEndpoint {
         "search/person".to_string()
     }
 
-    fn query(&self) -> Vec<(String, String)> {
-        vec![(
-            "query".to_string(),
-            self.query
-                .clone(),
-        )]
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        self
     }
 }
 
@@ -393,9 +390,168 @@ impl Endpoint for PersonDetailsEndpoint {
     fn path(&self) -> String {
         format!("person/{}", self.person_id)
     }
+}
 
-    fn query(&self) -> Vec<(String, String)> {
-        vec![]
+/// `GET /discover/movie`
+#[derive(Debug, Clone)]
+pub struct DiscoverMovieEndpoint {
+    pub query: DiscoverQuery,
+}
+
+impl Endpoint for DiscoverMovieEndpoint {
+    type Output = PaginatedResponse<movie::MovieSearchResult>;
+
+    fn path(&self) -> String {
+        "discover/movie".to_string()
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.query
+    }
+}
+
+/// `GET /discover/tv`
+#[derive(Debug, Clone)]
+pub struct DiscoverTvEndpoint {
+    pub query: DiscoverQuery,
+}
+
+impl Endpoint for DiscoverTvEndpoint {
+    type Output = PaginatedResponse<series::SeriesSearchResult>;
+
+    fn path(&self) -> String {
+        "discover/tv".to_string()
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        &self.query
+    }
+}
+
+/// Time window for TMDB trending endpoints.
+#[derive(Debug, Clone, Copy)]
+pub enum TrendingWindow {
+    Day,
+    Week,
+}
+
+impl TrendingWindow {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+        }
+    }
+}
+
+/// `GET /trending/movie/{window}`
+#[derive(Debug, Clone)]
+pub struct TrendingMovieEndpoint {
+    pub window: TrendingWindow,
+    pub page: Option<u32>,
+}
+
+impl Endpoint for TrendingMovieEndpoint {
+    type Output = PaginatedResponse<movie::MovieSearchResult>;
+
+    fn path(&self) -> String {
+        format!(
+            "trending/movie/{}",
+            self.window
+                .as_str()
+        )
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        [(
+            "page",
+            self.page
+                .map(|p| p.to_string()),
+        )]
+    }
+}
+
+/// `GET /trending/tv/{window}`
+#[derive(Debug, Clone)]
+pub struct TrendingTvEndpoint {
+    pub window: TrendingWindow,
+    pub page: Option<u32>,
+}
+
+impl Endpoint for TrendingTvEndpoint {
+    type Output = PaginatedResponse<series::SeriesSearchResult>;
+
+    fn path(&self) -> String {
+        format!(
+            "trending/tv/{}",
+            self.window
+                .as_str()
+        )
+    }
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        [(
+            "page",
+            self.page
+                .map(|p| p.to_string()),
+        )]
+    }
+}
+
+/// A single streaming/rental/purchase provider entry.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WatchProvider {
+    pub provider_id: i64,
+    pub provider_name: String,
+}
+
+/// Per-country availability from `/watch/providers`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WatchProviderCountry {
+    #[serde(default)]
+    pub flatrate: Vec<WatchProvider>,
+    #[serde(default)]
+    pub rent: Vec<WatchProvider>,
+    #[serde(default)]
+    pub buy: Vec<WatchProvider>,
+}
+
+/// Response for `/movie/{id}/watch/providers` and `/tv/{id}/watch/providers`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct WatchProvidersResponse {
+    pub id: i64,
+    /// Keys are ISO 3166-1 alpha-2 country codes.
+    #[serde(default)]
+    pub results: std::collections::HashMap<String, WatchProviderCountry>,
+}
+
+/// `GET /movie/{movie_id}/watch/providers`
+#[derive(Debug, Clone, Serialize)]
+pub struct MovieWatchProvidersEndpoint {
+    #[serde(skip)]
+    pub movie_id: i64,
+}
+
+impl Endpoint for MovieWatchProvidersEndpoint {
+    type Output = WatchProvidersResponse;
+
+    fn path(&self) -> String {
+        format!("movie/{}/watch/providers", self.movie_id)
+    }
+}
+
+/// `GET /tv/{series_id}/watch/providers`
+#[derive(Debug, Clone, Serialize)]
+pub struct TvWatchProvidersEndpoint {
+    #[serde(skip)]
+    pub series_id: i64,
+}
+
+impl Endpoint for TvWatchProvidersEndpoint {
+    type Output = WatchProvidersResponse;
+
+    fn path(&self) -> String {
+        format!("tv/{}/watch/providers", self.series_id)
     }
 }
 

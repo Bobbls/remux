@@ -63,15 +63,36 @@ async fn prepare_squash(pool: &SqlitePool) -> Result<()> {
 
     match last {
         None => {}
-        Some(v) if v >= LAST_PRE_SQUASH => {
+        Some(v) if v < LAST_PRE_SQUASH => anyhow::bail!(
+            "Database schema is outdated. Please update to remux v0.8.0 first, \
+             then upgrade to this version."
+        ),
+        Some(v) if v < SQUASH_VERSION => {
             sqlx::query("DELETE FROM _sqlx_migrations")
                 .execute(pool)
                 .await?;
         }
-        Some(_) => anyhow::bail!(
-            "Database schema is outdated. Please update to remux v0.8.0 first, \
-             then upgrade to this version."
-        ),
+        Some(_) => {
+            // The squash migration may be edited (e.g. to update seed data).
+            // Patch the stored checksum to match the current file so sqlx
+            // accepts it without re-executing the migration.
+            if let Some(m) = sqlx::migrate!("./migrations")
+                .migrations
+                .iter()
+                .find(|m| m.version == SQUASH_VERSION)
+            {
+                sqlx::query(
+                    "UPDATE _sqlx_migrations SET checksum = ? WHERE version = ?",
+                )
+                .bind(
+                    m.checksum
+                        .as_ref(),
+                )
+                .bind(SQUASH_VERSION)
+                .execute(pool)
+                .await?;
+            }
+        }
     }
     Ok(())
 }
@@ -83,6 +104,13 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
         .await?;
 
     vacuum_if_needed(pool).await?;
+    // Ensure query-planner statistics are fresh on every startup. PRAGMA optimize
+    // only re-analyzes tables/indexes where stats are significantly out of date,
+    // so it is fast on subsequent startups and repairs any stale stats from
+    // installs that pre-date the per-task PRAGMA optimize.
+    sqlx::query("PRAGMA optimize")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -91,22 +119,32 @@ async fn vacuum_if_needed(pool: &SqlitePool) -> Result<()> {
         .fetch_one(pool)
         .await
         .unwrap_or(0);
-    if freelist > 100 {
+    if freelist > 500 {
         info!(
             freelist_pages = freelist,
-            "vacuuming database to apply auto_vacuum mode and reclaim freed pages"
+            "vacuuming database to reclaim freed pages"
         );
+        let mut conn = pool
+            .acquire()
+            .await?;
+        // VACUUM's internal sort operations use temp storage. The pool uses
+        // temp_store=memory for query performance, but that causes OOM on large
+        // databases during VACUUM. Switch to file-backed temp for this operation.
+        sqlx::query("PRAGMA temp_store = 1")
+            .execute(&mut *conn)
+            .await?;
         sqlx::query("VACUUM")
-            .execute(pool)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query("PRAGMA temp_store = 2")
+            .execute(&mut *conn)
             .await?;
     }
     Ok(())
 }
 
 async fn backfill_certification_age(pool: &SqlitePool) -> Result<()> {
-    let config = Settings::get_config(pool)
-        .await
-        .unwrap_or_default();
+    let config = Settings::get_config_or_default(pool).await;
     let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
         "SELECT id, certification FROM media WHERE certification IS NOT NULL AND certification_age IS NULL",
     )

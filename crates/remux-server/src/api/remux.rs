@@ -6,13 +6,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Duration, Utc};
-use remux_macros::{api_query, delete, get, post};
+use remux_macros::{delete, get, post, query};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    AppState,
+    AppState, OptionExt,
     db::{self, auth},
     sdks,
 };
@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 const CACHE_KEY_PREFIX: &str = "remux:cache:";
 
-#[api_query]
+#[query]
 #[derive(Debug, Default)]
 pub struct NamespaceQuery {
     #[serde(default)]
@@ -242,7 +242,7 @@ pub async fn remux_cache_get(
 ) -> Result<Response> {
     let ns = query.ns;
 
-    let Some(record) = load_cache_record(
+    let record = load_cache_record(
         &state
             .ctx
             .db,
@@ -250,9 +250,7 @@ pub async fn remux_cache_get(
         &key,
     )
     .await?
-    else {
-        return Ok(StatusCode::NOT_FOUND.into_response());
-    };
+    .context_not_found("not found")?;
 
     Ok((
         StatusCode::OK,
@@ -460,13 +458,12 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
         return Ok(StreamsResponse { streams });
     }
 
-    let config = db::Settings::get_config(
+    let config = db::Settings::get_config_or_default(
         &state
             .ctx
             .db,
     )
-    .await
-    .unwrap_or_default();
+    .await;
     let show_ungrouped = config
         .stream_groups_show_ungrouped
         .unwrap_or(true);
@@ -545,6 +542,42 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
     }
 
     Ok(StreamsResponse { streams: result })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MetricsStatusResponse {
+    pub daily_days: i64,
+    pub daily_window: i64,
+    pub last_updated_days_ago: Option<i64>,
+    pub item_count: i64,
+}
+
+#[get("/remux/metrics/status")]
+pub async fn remux_metrics_status(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+) -> Result<impl IntoResponse> {
+    let row = sqlx::query_as::<_, (i64, Option<i64>, i64)>(
+        "SELECT COUNT(DISTINCT period_key), \
+                CAST(julianday('now') - julianday(MAX(period_key)) AS INTEGER), \
+                COUNT(DISTINCT media_id) \
+         FROM popularity_agg \
+         WHERE period = 'daily' AND period_key >= date('now', '-14 days')",
+    )
+    .fetch_one(
+        &state
+            .ctx
+            .db,
+    )
+    .await?;
+
+    Ok(Json(MetricsStatusResponse {
+        daily_days: row.0,
+        daily_window: 14,
+        last_updated_days_ago: row.1,
+        item_count: row.2,
+    }))
 }
 
 #[get("/remux/streams/{id}")]

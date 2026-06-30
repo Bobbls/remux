@@ -3,18 +3,30 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::api::{EncodingOptions, ServerConfiguration};
+use remux_sdks::remux::IntroOptions;
 
 const SERVER_CONFIG_KEY: &str = "server_configuration";
 const ENCODING_CONFIG_KEY: &str = "encoding_configuration";
+const INTRO_CONFIG_KEY: &str = "intro_configuration";
 
 pub struct Settings;
 
 impl Settings {
     pub async fn get_config(db: &SqlitePool) -> Result<ServerConfiguration> {
-        Ok(match Self::get(db, SERVER_CONFIG_KEY).await? {
-            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
-            None => ServerConfiguration::default(),
-        })
+        match Self::get(db, SERVER_CONFIG_KEY).await? {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(ServerConfiguration::default()),
+        }
+    }
+
+    pub async fn get_config_or_default(db: &SqlitePool) -> ServerConfiguration {
+        match Self::get_config(db).await {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::error!("Failed to load server configuration: {err}");
+                ServerConfiguration::default()
+            }
+        }
     }
 
     pub async fn set_config(
@@ -38,6 +50,18 @@ impl Settings {
     ) -> Result<()> {
         let json = serde_json::to_string(opts)?;
         Self::set(db, ENCODING_CONFIG_KEY, &json).await
+    }
+
+    pub async fn get_intro_config(db: &SqlitePool) -> Result<IntroOptions> {
+        Ok(match Self::get(db, INTRO_CONFIG_KEY).await? {
+            Some(json) => serde_json::from_str(&json).unwrap_or_default(),
+            None => IntroOptions::default(),
+        })
+    }
+
+    pub async fn set_intro_config(db: &SqlitePool, opts: &IntroOptions) -> Result<()> {
+        let json = serde_json::to_string(opts)?;
+        Self::set(db, INTRO_CONFIG_KEY, &json).await
     }
 
     pub async fn init_server_id(db: &SqlitePool) -> Result<()> {

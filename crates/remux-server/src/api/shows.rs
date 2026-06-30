@@ -6,10 +6,13 @@ use axum::{
     response::IntoResponse,
 };
 use axum_extra::extract::Query;
-use remux_macros::{api_query, get};
+use remux_macros::{get, query};
 use uuid::Uuid;
 
-use crate::{AppState, OptionExt, api, db, db::auth};
+use crate::{
+    AppState, OptionExt, api, db,
+    db::{auth, media::push_release_date_filter},
+};
 use axum_anyhow::ApiResult as Result;
 
 use super::items::get_items;
@@ -22,6 +25,7 @@ pub fn livetv_view_item() -> api::BaseItemDto {
     api::BaseItemDto {
         id: livetv_view_id(),
         name: Some("Live TV".to_string()),
+        server_id: crate::common::server_id(),
         type_: api::MediaType::UserView,
         collection_type: Some(api::CollectionType::Livetv),
         is_folder: true,
@@ -152,19 +156,32 @@ pub async fn shows_nextup(
         .user
         .id;
 
-    // All episodes for the series in watch order (season asc, episode asc)
-    let episodes: Vec<db::Media> = sqlx::query_as(
-        "SELECT * FROM media \
-         WHERE grandparent_id = ? AND kind = 'episode' \
-         ORDER BY COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC",
-    )
-    .bind(grandparent_id)
-    .fetch_all(
+    let server_config = db::Settings::get_config_or_default(
         &state
             .ctx
             .db,
     )
-    .await?;
+    .await;
+    let release_threshold = server_config.release_date_threshold();
+
+    // All released episodes for the series in watch order (season asc, episode asc)
+    let mut ep_qb =
+        sqlx::QueryBuilder::new("SELECT * FROM media WHERE grandparent_id = ");
+    ep_qb
+        .push_bind(grandparent_id)
+        .push(" AND kind = 'episode'");
+    if let Some(t) = release_threshold {
+        push_release_date_filter(&mut ep_qb, "media", t, true);
+    }
+    ep_qb.push(" ORDER BY COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC");
+    let episodes: Vec<db::Media> = ep_qb
+        .build_query_as()
+        .fetch_all(
+            &state
+                .ctx
+                .db,
+        )
+        .await?;
 
     if episodes.is_empty() {
         return Ok(Json(api::BaseItemDtoQueryResult::default()).into_response());
@@ -285,6 +302,14 @@ async fn shows_nextup_all(
         .enable_resumable
         .unwrap_or(true);
 
+    let server_config = db::Settings::get_config_or_default(
+        &state
+            .ctx
+            .db,
+    )
+    .await;
+    let release_threshold = server_config.release_date_threshold();
+
     // Inner UNION selects last_played_at/played_at directly from idx_ums_user_play_state
     // (covering) so no second join to user_media_state is needed. UNION ALL is safe
     // because the two legs are mutually exclusive (play_count > 0 vs play_count = 0).
@@ -307,8 +332,8 @@ async fn shows_nextup_all(
          WHERE m.kind = 'episode' \
          AND m.grandparent_id IS NOT NULL \
          GROUP BY m.grandparent_id \
-         HAVING MAX(COALESCE(active.last_played_at, active.played_at)) >= ? \
-         ORDER BY MAX(COALESCE(active.last_played_at, active.played_at)) DESC \
+         HAVING MAX(COALESCE(active.last_played_at, active.played_at, '1970-01-01 00:00:00')) >= ? \
+         ORDER BY MAX(COALESCE(active.last_played_at, active.played_at, '1970-01-01 00:00:00')) DESC \
          LIMIT ?",
     )
     .bind(user_id)
@@ -351,6 +376,21 @@ async fn shows_nextup_all(
             .await?;
         all_episodes.extend(chunk_episodes);
     }
+    ep_qb.push(") AND kind = 'episode'");
+    if let Some(t) = release_threshold {
+        push_release_date_filter(&mut ep_qb, "media", t, true);
+    }
+    ep_qb.push(
+        " ORDER BY grandparent_id, COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC",
+    );
+    let all_episodes: Vec<db::Media> = ep_qb
+        .build_query_as()
+        .fetch_all(
+            &state
+                .ctx
+                .db,
+        )
+        .await?;
 
     let all_ep_ids: Vec<Uuid> = all_episodes
         .iter()
@@ -490,7 +530,7 @@ pub async fn shows_upcoming(
 // GET /shows/recommendations
 // --------------------------------------------------------------------------
 
-#[api_query]
+#[query]
 #[derive(Debug, Default)]
 pub struct GetShowRecommendationsQuery {
     pub user_id: Option<Uuid>,
@@ -632,6 +672,12 @@ mod test {
                 parent_id: Some(season.id),
                 parent_idx: Some(1),
                 idx: Some(idx as i64 + 1),
+                digital_released_at: Some(
+                    NaiveDate::from_ymd_opt(2020, 1, 1)
+                        .unwrap()
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap(),
+                ),
                 ..Default::default()
             };
             episode
@@ -928,6 +974,861 @@ mod test {
         assert_eq!(
             active_series_ids(&db, user.id, Some("2026-06-18")).await,
             vec![legacy_series.id],
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: full HTTP handler (requires test server + real auth)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn nextup_returns_episode_after_last_played_default_enable_resumable() {
+        // Reproduces the "NextUp returns no results but should" bug.
+        // A user has fully watched episode 1 of a series. NextUp (with the
+        // default EnableResumable=true) must return episode 2.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let now = Utc::now().naive_utc();
+
+        let (series, episodes) =
+            insert_series_with_episodes(db, "TestSeries", &["Ep1", "Ep2", "Ep3"]).await;
+
+        // Identify the authed user so we can insert state for them.
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+
+        // Episode 1 was fully watched.
+        insert_state(
+            db,
+            user.id,
+            episodes[0].id,
+            1, // play_count = 1
+            0, // position = 0 (reset after completion)
+            Some(now),
+            Some(now),
+        )
+        .await;
+
+        // Default path: no EnableResumable param → defaults to true.
+        let resp = server
+            .get("/shows/nextup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        // Must return exactly one item: episode 2 of this series.
+        assert_eq!(items.len(), 1, "NextUp should return episode 2");
+        assert_eq!(
+            items[0]["Id"]
+                .as_str()
+                .unwrap(),
+            episodes[1]
+                .id
+                .to_string(),
+            "NextUp should return episode 2, not {:?}",
+            items[0]["Name"]
+        );
+
+        // Sanity-check: the series UUID should be reachable via the result.
+        let _ = series.id;
+    }
+
+    #[tokio::test]
+    async fn nextup_enable_resumable_false_returns_episode_after_last_played() {
+        // Companion to the above: explicit EnableResumable=false must also find
+        // episode 2 after episode 1 is played.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let now = Utc::now().naive_utc();
+
+        let (_series, episodes) =
+            insert_series_with_episodes(db, "TestSeries2", &["Ep1", "Ep2", "Ep3"])
+                .await;
+
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+
+        insert_state(db, user.id, episodes[0].id, 1, 0, Some(now), Some(now)).await;
+
+        let resp = server
+            .get("/shows/nextup?EnableResumable=false")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            items.len(),
+            1,
+            "NextUp (EnableResumable=false) should return episode 2"
+        );
+        assert_eq!(
+            items[0]["Id"]
+                .as_str()
+                .unwrap(),
+            episodes[1]
+                .id
+                .to_string(),
+        );
+    }
+
+    #[tokio::test]
+    async fn nextup_in_progress_episode_returned_when_enable_resumable_true() {
+        // When the user has only started (not completed) episode 1 and
+        // EnableResumable=true (default), NextUp should return episode 1.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let now = Utc::now().naive_utc();
+
+        let (_series, episodes) =
+            insert_series_with_episodes(db, "TestSeries3", &["Ep1", "Ep2"]).await;
+
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+
+        // Episode 1 is in-progress (started but not completed).
+        insert_state(
+            db,
+            user.id,
+            episodes[0].id,
+            0,    // play_count = 0 (not finished)
+            1800, // position = 30 min in
+            None,
+            Some(now),
+        )
+        .await;
+
+        let resp = server
+            .get("/shows/nextup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0]["Id"]
+                .as_str()
+                .unwrap(),
+            episodes[0]
+                .id
+                .to_string(),
+            "In-progress episode 1 should be returned as NextUp when EnableResumable=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn nextup_with_null_play_dates_still_returns_results() {
+        // Reproduces the core bug: play state imported from Jellyfin may have
+        // play_count=1 but both played_at and last_played_at as NULL (Jellyfin
+        // doesn't always export LastPlayedDate). The active_series SQL query uses
+        // HAVING MAX(COALESCE(last_played_at, played_at)) >= ?, and NULL >= ?
+        // is always false in SQLite, so those series are silently dropped.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let (_series, episodes) =
+            insert_series_with_episodes(db, "NullDateSeries", &["Ep1", "Ep2", "Ep3"])
+                .await;
+
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+
+        // Episode 1 played but with NULL dates (e.g. imported from Jellyfin without LastPlayedDate).
+        insert_state(
+            db,
+            user.id,
+            episodes[0].id,
+            1,    // play_count = 1
+            0,    // position = 0
+            None, // played_at = NULL
+            None, // last_played_at = NULL
+        )
+        .await;
+
+        let resp = server
+            .get("/shows/nextup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        // Should return episode 2 — the null dates must not silently drop the series.
+        assert_eq!(
+            items.len(),
+            1,
+            "NextUp must return results even when play dates are NULL (Jellyfin import case)"
+        );
+        assert_eq!(
+            items[0]["Id"]
+                .as_str()
+                .unwrap(),
+            episodes[1]
+                .id
+                .to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn nextup_skips_unreleased_episodes_when_release_date_filter_enabled() {
+        // Regression for #35: episodes with a future digital_released_at must not
+        // appear in Next Up even when the user has finished everything released so far.
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        // Enable the release-date filter with a 0-day buffer (strict: only past/today).
+        let cfg = api::ServerConfiguration {
+            filter_by_digital_release_date: true,
+            digital_release_buffer_days: 0,
+            ..Default::default()
+        };
+        db::Settings::set_config(db, &cfg)
+            .await
+            .unwrap();
+
+        let now = Utc::now().naive_utc();
+        let future = now + chrono::Duration::days(30);
+
+        let series_imdb = db::NonEmptyString::try_new("tt9999991".to_string()).unwrap();
+        let mut series = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Series,
+                external_ids: db::ExternalIds {
+                    imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: None,
+                episode: None,
+            }),
+            title: "FutureSeries".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut season = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Season,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: None,
+            }),
+            title: "FutureSeries Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(series.id),
+            idx: Some(1),
+            ..Default::default()
+        };
+        season
+            .save(db)
+            .await
+            .unwrap();
+
+        // Ep1: already released and played.
+        let mut ep1 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Episode,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: Some(1),
+            }),
+            title: "Ep1".to_string(),
+            kind: db::MediaKind::Episode,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(season.id),
+            parent_idx: Some(1),
+            idx: Some(1),
+            digital_released_at: Some(now - chrono::Duration::days(7)),
+            ..Default::default()
+        };
+        ep1.save(db)
+            .await
+            .unwrap();
+
+        // Ep2: not yet released — must be hidden from Next Up.
+        let mut ep2 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Episode,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: Some(2),
+            }),
+            title: "Ep2 (unreleased)".to_string(),
+            kind: db::MediaKind::Episode,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(season.id),
+            parent_idx: Some(1),
+            idx: Some(2),
+            digital_released_at: Some(future),
+            ..Default::default()
+        };
+        ep2.save(db)
+            .await
+            .unwrap();
+
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+
+        insert_state(db, user.id, ep1.id, 1, 0, Some(now), Some(now)).await;
+
+        let resp = server
+            .get("/shows/nextup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            items.len(),
+            0,
+            "NextUp must not return unreleased episode Ep2; got: {:?}",
+            items
+        );
+    }
+
+    /// An episode with no air date (`digital_released_at = NULL`, `released_at = NULL`)
+    /// must not appear in Next Up for its series. Anime series on TVDB often have upcoming
+    /// seasons with no scheduled air date. Currently fails because `push_episode_date_filter`
+    /// falls back to `'1900-01-01'` for NULL dates, treating them as already released.
+    #[tokio::test]
+    async fn nextup_excludes_null_air_date_episode() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let now = Utc::now().naive_utc();
+
+        let series_imdb =
+            db::NonEmptyString::try_new("tt_null_nup_001".to_string()).unwrap();
+
+        let mut series = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Series,
+                external_ids: db::ExternalIds {
+                    imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: None,
+                episode: None,
+            }),
+            title: "NullDateNextUpSeries".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut season = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Season,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: None,
+            }),
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(series.id),
+            idx: Some(1),
+            ..Default::default()
+        };
+        season
+            .save(db)
+            .await
+            .unwrap();
+
+        // ep1: released and played
+        let mut ep1 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Episode,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: Some(1),
+            }),
+            title: "Ep1".to_string(),
+            kind: db::MediaKind::Episode,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(season.id),
+            parent_idx: Some(1),
+            idx: Some(1),
+            digital_released_at: Some(now - chrono::Duration::days(7)),
+            ..Default::default()
+        };
+        ep1.save(db)
+            .await
+            .unwrap();
+
+        // ep2: no air date — upcoming anime episode with no scheduled release
+        let mut ep2 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Episode,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: Some(2),
+            }),
+            title: "Ep2 (no air date)".to_string(),
+            kind: db::MediaKind::Episode,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(season.id),
+            parent_idx: Some(1),
+            idx: Some(2),
+            digital_released_at: None,
+            released_at: None,
+            ..Default::default()
+        };
+        ep2.save(db)
+            .await
+            .unwrap();
+
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+
+        // Mark ep1 as fully watched.
+        insert_state(db, user.id, ep1.id, 1, 0, Some(now), Some(now)).await;
+
+        // Query series-scoped Next Up — ep2 must not appear (NULL date = unreleased).
+        let resp = server
+            .get(&format!("/shows/nextup?SeriesId={}", series.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            items.len(),
+            0,
+            "null-date episode must not appear in Next Up; got: {:?}",
+            items
+        );
+    }
+
+    /// Season with a future `digital_released_at` set directly on the season row.
+    #[tokio::test]
+    async fn seasons_hides_unreleased_season() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let cfg = api::ServerConfiguration {
+            filter_by_digital_release_date: true,
+            digital_release_buffer_days: 0,
+            ..Default::default()
+        };
+        db::Settings::set_config(db, &cfg)
+            .await
+            .unwrap();
+        let now = Utc::now().naive_utc();
+        let past = now - chrono::Duration::days(30);
+        let future = now + chrono::Duration::days(30);
+
+        let series_imdb =
+            db::NonEmptyString::try_new("tt_seasons_unreleased_001".to_string())
+                .unwrap();
+
+        let mut series = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Series,
+                external_ids: db::ExternalIds {
+                    imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: None,
+                episode: None,
+            }),
+            title: "TestSeries".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        // Season 1: already released.
+        let mut season1 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Season,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: None,
+            }),
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(series.id),
+            idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        season1
+            .save(db)
+            .await
+            .unwrap();
+
+        // Season 2: premiere in the future — must be hidden.
+        let mut season2 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Season,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(2),
+                episode: None,
+            }),
+            title: "Season 2".to_string(),
+            kind: db::MediaKind::Season,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(series.id),
+            idx: Some(2),
+            digital_released_at: Some(future),
+            released_at: Some(future),
+            ..Default::default()
+        };
+        season2
+            .save(db)
+            .await
+            .unwrap();
+
+        let resp = server
+            .get(&format!(
+                "/shows/{}/seasons?userId={}",
+                series.id, series.id
+            ))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            items.len(),
+            1,
+            "only the released Season 1 should appear; got: {:?}",
+            items
+        );
+        assert_eq!(
+            items[0]["IndexNumber"]
+                .as_i64()
+                .unwrap(),
+            1,
+            "the returned season must be Season 1"
+        );
+    }
+
+    /// Season with NULL dates and no released episodes must be hidden (upcoming
+    /// TVDB season with no scheduled date should not inherit the series premiere).
+    #[tokio::test]
+    async fn seasons_hides_null_date_season_with_no_released_episodes() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let cfg = api::ServerConfiguration {
+            filter_by_digital_release_date: true,
+            digital_release_buffer_days: 0,
+            ..Default::default()
+        };
+        db::Settings::set_config(db, &cfg)
+            .await
+            .unwrap();
+
+        let now = Utc::now().naive_utc();
+        let past = now - chrono::Duration::days(365);
+
+        let series_imdb =
+            db::NonEmptyString::try_new("tt_seasons_null_tvdb_001".to_string())
+                .unwrap();
+
+        let mut series = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Series,
+                external_ids: db::ExternalIds {
+                    imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: None,
+                episode: None,
+            }),
+            title: "NullTvdbSeries".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        series
+            .save(db)
+            .await
+            .unwrap();
+
+        let mut season1 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Season,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(1),
+                episode: None,
+            }),
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(series.id),
+            idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        season1
+            .save(db)
+            .await
+            .unwrap();
+
+        // Season 2: TVDB knows it exists but has no air date yet.
+        let mut season2 = db::Media {
+            id: uuid::Uuid::from(&db::MediaIdRaw {
+                kind: db::MediaKind::Season,
+                external_ids: db::ExternalIds {
+                    series_imdb: Some(series_imdb.clone()),
+                    ..Default::default()
+                },
+                season: Some(2),
+                episode: None,
+            }),
+            title: "Season 2".to_string(),
+            kind: db::MediaKind::Season,
+            external_ids: db::ExternalIds {
+                series_imdb: Some(series_imdb.clone()),
+                ..Default::default()
+            },
+            grandparent_id: Some(series.id),
+            parent_id: Some(series.id),
+            idx: Some(2),
+            digital_released_at: None,
+            released_at: None,
+            ..Default::default()
+        };
+        season2
+            .save(db)
+            .await
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/shows/{}/seasons", series.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            items.len(),
+            1,
+            "Season 2 has no dates — must not appear; got: {:?}",
+            items
+        );
+        assert_eq!(
+            items[0]["IndexNumber"]
+                .as_i64()
+                .unwrap(),
+            1
         );
     }
 }

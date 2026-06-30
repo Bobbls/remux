@@ -457,7 +457,12 @@ impl IndexAddon for OpendalAddon {
         addon: &Addon,
         progress: ProgressReporter,
     ) -> Result<()> {
-        let tmdb = common::tmdb_client(&ctx.db).await;
+        let tmdb = common::tmdb_client(
+            &ctx.db,
+            &ctx.config
+                .tmdb_base_url,
+        )
+        .await;
         scan_addon(ctx, &tmdb, addon).await?;
         progress.set(100.0);
         Ok(())
@@ -1364,13 +1369,41 @@ async fn scan_addon(
                     let episode = parsed
                         .episode()
                         .map(|e| e as i64);
-                    let year = parsed
-                        .year()
-                        .map(|y| y as i64);
-                    let clean_title = parsed
+
+                    // When the filename starts with the episode code (e.g. "S01E07 - Title"),
+                    // hunch finds no title before it and returns None. In that case the series
+                    // folder name is the authoritative source; using the stem would store the
+                    // episode title (or the whole filename) as the series name.
+                    let (clean_title, year) = match parsed
                         .title()
-                        .unwrap_or(stem.as_str())
-                        .to_string();
+                        .filter(|t| !t.is_empty())
+                    {
+                        Some(t) => {
+                            let year = parsed
+                                .year()
+                                .map(|y| y as i64);
+                            (t.to_string(), year)
+                        }
+                        None if path_components.len() >= 2 => {
+                            let series_dir = path_components[0];
+                            let dir_parsed = hunch::hunch(series_dir);
+                            let title = dir_parsed
+                                .title()
+                                .filter(|t| !t.is_empty())
+                                .unwrap_or(series_dir)
+                                .to_string();
+                            let year = dir_parsed
+                                .year()
+                                .map(|y| y as i64);
+                            (title, year)
+                        }
+                        _ => {
+                            let year = parsed
+                                .year()
+                                .map(|y| y as i64);
+                            (stem.clone(), year)
+                        }
+                    };
 
                     let existing_imdb =
                         fetch_existing_imdb(ctx, addon.id, &path).await?;
@@ -1668,12 +1701,61 @@ mod tests {
 
     use super::*;
     use crate::{
+        Config,
         addons::{Addon, AddonPresetRef},
-        common::ProgressReporter,
+        api,
+        common::{self, ProgressReporter},
         db,
-        integration_test::new_test_server,
+        integration_test::{new_test_server, new_test_server_with_config},
+        sdks,
         stream::StreamDescriptor,
     };
+
+    fn tmdb_test_client(base_url: &str) -> Option<sdks::RestClient<sdks::BearerAuth>> {
+        Some(
+            sdks::RestClient::new(base_url)
+                .unwrap()
+                .with_auth(sdks::BearerAuth {
+                    token: String::new(),
+                }),
+        )
+    }
+
+    fn mock_tv_series(server: &httpmock::MockServer, tmdb_id: i64, imdb_id: &str) {
+        let imdb = imdb_id.to_string();
+        server.mock(|when, then| {
+            when.path(format!("/tv/{tmdb_id}"));
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": tmdb_id,
+                    "external_ids": { "imdb_id": imdb }
+                }));
+        });
+    }
+
+    fn register_all_shows(server: &httpmock::MockServer) {
+        mock_tv_series(server, 157842, "tt21249100");
+        mock_tv_series(server, 30984, "tt0434665");
+        mock_tv_series(server, 43270, "tt1890725");
+    }
+
+    async fn test_server_with_tmdb(
+        tmdb: &httpmock::MockServer,
+    ) -> (crate::AppContext, crate::integration_test::TestGuard) {
+        let (_, guard) = new_test_server_with_config(Config {
+            database_url: Some("sqlite::memory:".into()),
+            torrent_http_port: None,
+            disable_dht: true,
+            tmdb_base_url: tmdb.base_url(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let ctx = guard
+            .0
+            .clone();
+        (ctx, guard)
+    }
 
     fn noop_progress() -> ProgressReporter {
         ProgressReporter::new(Arc::new(AtomicU64::new(0)))
@@ -1726,6 +1808,18 @@ mod tests {
         };
 
         (addon_kind, db_addon)
+    }
+
+    fn write_files(dir: &std::path::Path, files: &[(&str, &[u8])]) {
+        for (rel, content) in files {
+            let full = dir.join(rel);
+            std::fs::create_dir_all(
+                full.parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&full, content).unwrap();
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1924,6 +2018,51 @@ mod tests {
                 expected_season: 1,
                 expected_episode: 1,
             },
+            // --- Black Summoner (2022) [tvdbid-416588] ---
+            EpisodeFixture {
+                rel_path: "[imdbid-tt21249100] Black Summoner (2022)/Season 01/Black.Summoner.S01E01.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            EpisodeFixture {
+                rel_path: "[imdbid-tt21249100] Black Summoner (2022)/Season 01/Black.Summoner.S01E02.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+            // --- Bleach (2004) [tvdbid-74796] ---
+            EpisodeFixture {
+                rel_path: "[imdbid-tt0434665] Bleach (2004)/Season 01/Bleach.S01E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            EpisodeFixture {
+                rel_path: "[imdbid-tt0434665] Bleach (2004)/Season 01/Bleach.S01E02.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+            EpisodeFixture {
+                rel_path: "[imdbid-tt0434665] Bleach (2004)/Season 02/Bleach.S02E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 2,
+                expected_episode: 1,
+            },
+            // --- Blood-C (2011) [tvdbid-249864] ---
+            EpisodeFixture {
+                rel_path: "[imdbid-tt1890725] Blood-C (2011)/Season 01/Blood-C.S01E01.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            EpisodeFixture {
+                rel_path: "[imdbid-tt1890725] Blood-C (2011)/Season 01/Blood-C.S01E02.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 2,
+            },
         ];
 
         let dir = tempfile::tempdir().unwrap();
@@ -1988,7 +2127,7 @@ mod tests {
                         .imdb,
                 )
         });
-        assert_eq!(series_items.len(), 3, "catalog should contain three Series");
+        assert_eq!(series_items.len(), 6, "catalog should contain six Series");
         assert!(
             series_items
                 .iter()
@@ -2237,6 +2376,44 @@ mod tests {
             !StreamAddon::supports(&addon, &ep_with_imdb_only),
             "stream_supports must be false for episode with only imdb (not series_imdb)"
         );
+    }
+
+    // A local "episode" source is a Series library, so catalogs_for_kinds must
+    // admit its catalog when Series is requested (as RefreshLibraryTask does), but
+    // not for an unrelated kind.
+    #[tokio::test]
+    async fn episode_catalog_admitted_when_series_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let (_, db_addon) = make_local_addon(ctx, dir.path(), "episode").await;
+        ctx.addons
+            .reload(&ctx.db, &ctx.config)
+            .await
+            .unwrap();
+
+        for (requested, should_admit) in
+            [(db::MediaKind::Series, true), (db::MediaKind::Movie, false)]
+        {
+            let admitted = ctx
+                .addons
+                .catalogs_for_kinds(ctx, &[requested.clone()])
+                .await
+                .into_iter()
+                .find(|(rt, _)| {
+                    rt.row
+                        .id
+                        == db_addon.id
+                })
+                .is_some_and(|(_, cats)| !cats.is_empty());
+            assert_eq!(
+                admitted, should_admit,
+                "episode catalog admission for {requested:?} should be {should_admit}"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -2836,5 +3013,779 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sub_count, 0, "stale subtitle row should be pruned");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_imdb: title-search fallback (live TMDB) — the path taken when a
+    // file has no external-id tag at all and title+year are parsed from the name.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resolve_imdb_by_title_black_summoner() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.path("/search/tv")
+                .query_param("query", "Black Summoner");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "results": [{"id": 157842, "name": "Black Summoner"}]
+                }));
+        });
+        mock_tv_series(&server, 157842, "tt21249100");
+
+        let result = resolve_imdb(
+            &tmdb_test_client(&server.base_url()),
+            "Black Summoner",
+            Some(2022),
+            true,
+        )
+        .await;
+        assert_eq!(
+            result.as_deref(),
+            Some("tt21249100"),
+            "Black Summoner title search"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_imdb_by_title_bleach() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.path("/search/tv")
+                .query_param("query", "Bleach");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "results": [{"id": 30984, "name": "Bleach"}]
+                }));
+        });
+        mock_tv_series(&server, 30984, "tt0434665");
+
+        let result = resolve_imdb(
+            &tmdb_test_client(&server.base_url()),
+            "Bleach",
+            Some(2004),
+            true,
+        )
+        .await;
+        assert_eq!(result.as_deref(), Some("tt0434665"), "Bleach title search");
+    }
+
+    #[tokio::test]
+    async fn resolve_imdb_by_title_blood_c() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.path("/search/tv")
+                .query_param("query", "Blood-C");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "results": [{"id": 43270, "name": "Blood-C"}]
+                }));
+        });
+        mock_tv_series(&server, 43270, "tt1890725");
+
+        let result = resolve_imdb(
+            &tmdb_test_client(&server.base_url()),
+            "Blood-C",
+            Some(2011),
+            true,
+        )
+        .await;
+        assert_eq!(result.as_deref(), Some("tt1890725"), "Blood-C title search");
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: tvdbid-tagged episodes — scanner resolves tvdbid → imdbid via live
+    // TMDB and stores the resolved imdb_id in opendal_files.
+    // -----------------------------------------------------------------------
+
+    struct ResolveFixture {
+        rel_path: &'static str,
+        expected_imdb: &'static str,
+        expected_season: i64,
+        expected_episode: i64,
+    }
+
+    #[tokio::test]
+    async fn opendal_local_episode_tvdb_resolve() {
+        let fixtures: &[ResolveFixture] = &[
+            // --- Black Summoner (2022) [tvdbid-416588] → tt21249100 ---
+            ResolveFixture {
+                rel_path: "Black Summoner (2022) [tvdbid-416588]/Season 01/Black.Summoner.S01E01.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Black Summoner (2022) [tvdbid-416588]/Season 01/Black.Summoner.S01E02.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+            // --- Bleach (2004) [tvdbid-74796] → tt0434665 ---
+            ResolveFixture {
+                rel_path: "Bleach (2004) [tvdbid-74796]/Season 01/Bleach.S01E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Bleach (2004) [tvdbid-74796]/Season 01/Bleach.S01E02.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+            ResolveFixture {
+                rel_path: "Bleach (2004) [tvdbid-74796]/Season 02/Bleach.S02E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 2,
+                expected_episode: 1,
+            },
+            // --- Blood-C (2011) [tvdbid-249864] → tt1890725 ---
+            ResolveFixture {
+                rel_path: "Blood-C (2011) [tvdbid-249864]/Season 01/Blood-C.S01E01.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Blood-C (2011) [tvdbid-249864]/Season 01/Blood-C.S01E02.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        for f in fixtures {
+            let full = dir
+                .path()
+                .join(f.rel_path);
+            std::fs::create_dir_all(
+                full.parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&full, b"fake ep").unwrap();
+        }
+
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/find/416588")
+                .query_param("external_source", "tvdb_id");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_results": [{"id": 157842, "name": "Black Summoner"}],
+                    "movie_results": []
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/find/74796")
+                .query_param("external_source", "tvdb_id");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_results": [{"id": 30984, "name": "Bleach"}],
+                    "movie_results": []
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/find/249864")
+                .query_param("external_source", "tvdb_id");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_results": [{"id": 43270, "name": "Blood-C"}],
+                    "movie_results": []
+                }));
+        });
+        register_all_shows(&tmdb);
+
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+
+        let (addon, db_addon) = make_local_addon(&ctx, dir.path(), "episode").await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        for f in fixtures {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM opendal_files \
+                 WHERE addon_id = ? AND media_kind = 'episode' \
+                   AND imdb_id = ? AND season = ? AND episode = ?",
+            )
+            .bind(db_addon.id)
+            .bind(f.expected_imdb)
+            .bind(f.expected_season)
+            .bind(f.expected_episode)
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 1,
+                "{}: expected imdb={} s={} e={} after tvdbid→imdb resolution",
+                f.rel_path, f.expected_imdb, f.expected_season, f.expected_episode
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: tmdbid-tagged episodes — scanner resolves tmdbid → imdbid via
+    // SeriesEndpoint and stores the result.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_local_episode_tmdbid_resolve() {
+        let fixtures: &[ResolveFixture] = &[
+            // --- Black Summoner (2022) [tmdbid-157842] → tt21249100 ---
+            ResolveFixture {
+                rel_path: "Black Summoner (2022) [tmdbid-157842]/Season 01/Black.Summoner.S01E01.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Black Summoner (2022) [tmdbid-157842]/Season 01/Black.Summoner.S01E02.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+            // --- Bleach (2004) [tmdbid-30984] → tt0434665 ---
+            ResolveFixture {
+                rel_path: "Bleach (2004) [tmdbid-30984]/Season 01/Bleach.S01E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Bleach (2004) [tmdbid-30984]/Season 02/Bleach.S02E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 2,
+                expected_episode: 1,
+            },
+            // --- Blood-C (2011) [tmdbid-43270] → tt1890725 ---
+            ResolveFixture {
+                rel_path: "Blood-C (2011) [tmdbid-43270]/Season 01/Blood-C.S01E01.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Blood-C (2011) [tmdbid-43270]/Season 01/Blood-C.S01E02.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        for f in fixtures {
+            let full = dir
+                .path()
+                .join(f.rel_path);
+            std::fs::create_dir_all(
+                full.parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&full, b"fake ep").unwrap();
+        }
+
+        let tmdb = httpmock::MockServer::start();
+        register_all_shows(&tmdb);
+
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+
+        let (addon, db_addon) = make_local_addon(&ctx, dir.path(), "episode").await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        for f in fixtures {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM opendal_files \
+                 WHERE addon_id = ? AND media_kind = 'episode' \
+                   AND imdb_id = ? AND season = ? AND episode = ?",
+            )
+            .bind(db_addon.id)
+            .bind(f.expected_imdb)
+            .bind(f.expected_season)
+            .bind(f.expected_episode)
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 1,
+                "{}: expected imdb={} s={} e={} after tmdbid→imdb resolution",
+                f.rel_path, f.expected_imdb, f.expected_season, f.expected_episode
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: no-label episodes — no external ID tag anywhere in the path; scanner
+    // falls back to title+year search (resolve_imdb) to find the imdbid.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_local_episode_no_label_resolve() {
+        let fixtures: &[ResolveFixture] = &[
+            // --- Black Summoner — parsed title: "Black Summoner" → tt21249100 ---
+            ResolveFixture {
+                rel_path: "Black Summoner/Season 01/Black.Summoner.S01E01.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Black Summoner/Season 01/Black.Summoner.S01E02.mkv",
+                expected_imdb: "tt21249100",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+            // --- Bleach — parsed title: "Bleach" → tt0434665 ---
+            ResolveFixture {
+                rel_path: "Bleach/Season 01/Bleach.S01E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Bleach/Season 02/Bleach.S02E01.mkv",
+                expected_imdb: "tt0434665",
+                expected_season: 2,
+                expected_episode: 1,
+            },
+            // --- Blood-C — parsed title: "Blood-C" → tt1890725 ---
+            ResolveFixture {
+                rel_path: "Blood-C/Season 01/Blood-C.S01E01.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 1,
+            },
+            ResolveFixture {
+                rel_path: "Blood-C/Season 01/Blood-C.S01E02.mkv",
+                expected_imdb: "tt1890725",
+                expected_season: 1,
+                expected_episode: 2,
+            },
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        for f in fixtures {
+            let full = dir
+                .path()
+                .join(f.rel_path);
+            std::fs::create_dir_all(
+                full.parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&full, b"fake ep").unwrap();
+        }
+
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/search/tv")
+                .query_param("query", "Black Summoner");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "results": [{"id": 157842, "name": "Black Summoner"}]
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/search/tv")
+                .query_param("query", "Bleach");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "results": [{"id": 30984, "name": "Bleach"}]
+                }));
+        });
+        tmdb.mock(|when, then| {
+            when.path("/search/tv")
+                .query_param("query", "Blood-C");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "results": [{"id": 43270, "name": "Blood-C"}]
+                }));
+        });
+        register_all_shows(&tmdb);
+
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+
+        let (addon, db_addon) = make_local_addon(&ctx, dir.path(), "episode").await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        for f in fixtures {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM opendal_files \
+                 WHERE addon_id = ? AND media_kind = 'episode' \
+                   AND imdb_id = ? AND season = ? AND episode = ?",
+            )
+            .bind(db_addon.id)
+            .bind(f.expected_imdb)
+            .bind(f.expected_season)
+            .bind(f.expected_episode)
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap();
+            assert_eq!(
+                count, 1,
+                "{}: expected imdb={} s={} e={} after title-search resolution",
+                f.rel_path, f.expected_imdb, f.expected_season, f.expected_episode
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: movie resolve — tmdbid tag and no-label (title+year search).
+    // Also verifies catalog_stream surfaces the indexed movies.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_local_movie_resolve() {
+        // (rel_path, expected_imdb)
+        let fixtures: &[(&str, &str)] = &[
+            // [tmdbid-603] → The Matrix → tt0133093
+            (
+                "[tmdbid-603] The Matrix (1999)/The.Matrix.1999.mkv",
+                "tt0133093",
+            ),
+            // No label: title+year parsed from filename → TMDB search
+            ("Interstellar.2014.mkv", "tt0816692"),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &fixtures
+                .iter()
+                .map(|(p, _)| (*p, b"fake" as &[u8]))
+                .collect::<Vec<_>>(),
+        );
+
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "movie").await;
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        // Every fixture must have a DB row.
+        for (path, imdb) in fixtures {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM opendal_files \
+                 WHERE addon_id = ? AND media_kind = 'movie' AND imdb_id = ?",
+            )
+            .bind(db_addon.id)
+            .bind(imdb)
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap();
+            assert_eq!(count, 1, "{path}: expected imdb={imdb}");
+        }
+
+        // catalog_stream must return one Movie item per distinct IMDB.
+        let catalog: Vec<db::Media> = addon
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(
+            catalog.len(),
+            fixtures.len(),
+            "catalog should have one entry per movie"
+        );
+        assert!(
+            catalog
+                .iter()
+                .all(|m| m.kind == db::MediaKind::Movie)
+        );
+        for (_, imdb) in fixtures {
+            assert!(
+                catalog
+                    .iter()
+                    .any(|m| m
+                        .external_ids
+                        .imdb
+                        .as_deref()
+                        .map(|s| s.as_str())
+                        == Some(imdb)),
+                "catalog missing movie with imdb={imdb}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: track indexing — track_number extraction, catalog, and get_streams.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_local_track_index_and_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("01 - First Song.mp3", b"audio"),
+                ("02. Second Song.flac", b"audio"),
+                ("Track Without Number.ogg", b"audio"),
+            ],
+        );
+
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "track").await;
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        // Verify track_number and title are stored correctly.
+        let rows: Vec<(Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT title, track_number FROM opendal_files \
+             WHERE addon_id = ? AND media_kind = 'track' ORDER BY COALESCE(track_number, 999)",
+        )
+        .bind(db_addon.id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], (Some("First Song".to_string()), Some(1)));
+        assert_eq!(rows[1], (Some("Second Song".to_string()), Some(2)));
+        assert_eq!(
+            rows[2].1, None,
+            "unnumbered track must have track_number=NULL"
+        );
+
+        // catalog_stream must return one Track per file.
+        let catalog: Vec<db::Media> = addon
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(catalog.len(), 3);
+        assert!(
+            catalog
+                .iter()
+                .all(|m| m.kind == db::MediaKind::Track)
+        );
+
+        // get_streams must return a Local stream for each track (matched by title).
+        for item in &catalog {
+            let streams = addon
+                .get_streams(item, ctx)
+                .await
+                .unwrap();
+            assert!(
+                !streams.is_empty(),
+                "get_streams empty for track {:?}",
+                item.title
+            );
+            assert!(
+                streams
+                    .iter()
+                    .all(|s| matches!(s.descriptor, StreamDescriptor::Local(_))),
+                "expected Local descriptor for track {:?}",
+                item.title
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: .strm files — the URL inside the file is stored as path, not the
+    // filesystem path of the .strm file itself.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_strm_stores_url_as_path() {
+        let url = "https://example.com/videos/matrix.mkv";
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[("[imdbid-tt0133093] The Matrix (1999).strm", url.as_bytes())],
+        );
+
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "movie").await;
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let stored_path: String = sqlx::query_scalar(
+            "SELECT path FROM opendal_files WHERE addon_id = ? AND imdb_id = 'tt0133093'",
+        )
+        .bind(db_addon.id)
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            stored_path, url,
+            ".strm path must be the URL from file contents"
+        );
+
+        // get_streams must also return the URL as the stream path.
+        let stub = db::Media {
+            id: common::get_stable_uuid("movie:tt0133093".to_string()),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt0133093".to_string()).ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let streams = addon
+            .get_streams(&stub, ctx)
+            .await
+            .unwrap();
+        assert_eq!(streams.len(), 1);
+        let path = match &streams[0].descriptor {
+            StreamDescriptor::Local(p) => p
+                .to_string_lossy()
+                .to_string(),
+            other => panic!("expected Local descriptor, got {other:?}"),
+        };
+        assert_eq!(path, url, "stream path must be the URL from the .strm file");
+    }
+
+    // -----------------------------------------------------------------------
+    // E2E: stale video rows are pruned when files are deleted and re-indexed.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_stale_video_prune() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir
+            .path()
+            .join("[imdbid-tt0133093] The Matrix (1999).mkv");
+        std::fs::write(&file, b"fake").unwrap();
+
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "movie").await;
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM opendal_files WHERE addon_id = ? AND media_kind = 'movie'",
+        )
+        .bind(db_addon.id)
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(count, 1, "file should be indexed on first scan");
+
+        std::fs::remove_file(&file).unwrap();
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM opendal_files WHERE addon_id = ? AND media_kind = 'movie'",
+        )
+        .bind(db_addon.id)
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "stale video row must be pruned after file is deleted"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Regression: episode files whose filename starts with "S01E07 - Episode Title"
+    // must store the *series* name (from the parent directory) as their title,
+    // not the episode title extracted from the filename.
+    //
+    // Reproduces: user report where "Wallace & Gromit's Cracking Contraptions"
+    // appeared as "S01E07 - The 525 CrackerVac" in the catalog.
+    // ---------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_episode_title_comes_from_series_dir_not_filename() {
+        // File that starts with SxxExx — hunch parses nothing useful as a series
+        // title from the filename alone; the series name lives in the parent dir.
+        let rel_path = "Wallace & Gromit's Cracking Contraptions (2002) [imdbid-tt0103584]/\
+                        Season 01/\
+                        S01E07 - The 525 CrackerVac [DVD][AC3 2.0][h265].mkv";
+
+        let dir = tempfile::tempdir().unwrap();
+        write_files(&dir.path(), &[(rel_path, b"fake")]);
+
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "episode").await;
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let row: Option<(Option<String>, Option<i64>, Option<i64>)> = sqlx::query_as(
+            "SELECT title, season, episode FROM opendal_files \
+             WHERE addon_id = ? AND media_kind = 'episode' AND imdb_id = 'tt0103584'",
+        )
+        .bind(db_addon.id)
+        .fetch_optional(&ctx.db)
+        .await
+        .unwrap();
+
+        let (title, season, episode) = row.expect(
+            "expected one opendal_files row for imdbid-tt0103584 — file was not indexed",
+        );
+
+        assert_eq!(season, Some(1), "season must be 1");
+        assert_eq!(episode, Some(7), "episode must be 7");
+
+        let title = title.unwrap_or_default();
+        // The series directory is the source of truth for the title.
+        // It must NOT contain the episode-filename portion ("The 525 CrackerVac")
+        // and must contain the actual series name.
+        assert!(
+            !title
+                .to_lowercase()
+                .contains("crackvac")
+                && !title
+                    .to_lowercase()
+                    .contains("crackervac")
+                && !title
+                    .to_lowercase()
+                    .contains("s01e07"),
+            "title must not be the episode filename; got: {title:?}"
+        );
+        assert!(
+            title
+                .to_lowercase()
+                .contains("wallace"),
+            "title must contain the series name from the directory; got: {title:?}"
+        );
     }
 }

@@ -8,7 +8,7 @@ use axum::{
 use axum_extra::extract::Query;
 use http::StatusCode;
 use itertools::Itertools;
-use remux_macros::{api_query, delete, get, patch, post};
+use remux_macros::{delete, get, patch, post, query};
 use serde::Deserialize;
 use tracing::{debug, error, info, trace, warn};
 use uuid::{Uuid, uuid};
@@ -53,6 +53,8 @@ pub struct ItemsQueryResultBuilder {
     session: auth::AuthSession,
     apply_permissions: bool,
     hide_sources: bool,
+    /// Per-client override for CollectionType::Mixed. None = leave as Mixed.
+    mixed_collection_type: Option<api::CollectionType>,
 }
 
 impl ItemsQueryResultBuilder {
@@ -67,6 +69,7 @@ impl ItemsQueryResultBuilder {
             session,
             apply_permissions: false,
             hide_sources: false,
+            mixed_collection_type: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl ItemsQueryResultBuilder {
             session,
             apply_permissions: false,
             hide_sources: false,
+            mixed_collection_type: None,
         }
     }
 
@@ -90,16 +94,22 @@ impl ItemsQueryResultBuilder {
     }
 
     pub fn with_client_patches(mut self) -> Self {
-        self.hide_sources = self
+        let client = &self
             .session
             .device
-            .app_name
-            == "Plezy";
+            .app_name;
+        self.hide_sources = client == "Plezy";
+        self.mixed_collection_type = if client.contains("Swiftfin") {
+            // Swiftfin's SDK has no "mixed" case; homevideos is accepted and shows a home row.
+            Some(api::CollectionType::Homevideos)
+        } else {
+            None
+        };
         self
     }
 
     pub fn build(self) -> ItemsQueryResult {
-        let items = match self.items {
+        let mut items: Vec<api::BaseItemDto> = match self.items {
             ItemsSource::Raw(media) => media
                 .into_iter()
                 .map(|m| {
@@ -133,6 +143,13 @@ impl ItemsQueryResultBuilder {
                 }
             }
         };
+        for item in &mut items {
+            if item.collection_type == Some(api::CollectionType::Mixed) {
+                item.collection_type = self
+                    .mixed_collection_type
+                    .clone();
+            }
+        }
         ItemsQueryResult {
             items,
             total_count: self.total_count,
@@ -153,9 +170,12 @@ pub async fn get_items(
     state: AppState,
     session: auth::AuthSession,
     mut q: api::GetItemsQuery,
-    _count: bool,
+    want_count: bool,
 ) -> Result<ItemsQueryResultBuilder> {
     //trace!(?q, "get_items");
+    if !want_count {
+        q.enable_total_record_count = Some(false);
+    }
     // Used only by pre-converting paths (search, playlist) that use with_dtos().
     // Raw-media paths delegate hide_sources to with_client_patches() on the builder.
     let hide_sources = session
@@ -189,11 +209,14 @@ pub async fn get_items(
                     .as_deref()
                     .map(|s| {
                         s.is_empty()
-                            || matches!(
-                                s.first(),
-                                Some(api::ItemSortBy::SortName)
-                                    | Some(api::ItemSortBy::Name)
-                            )
+                            || s.iter()
+                                .any(|v| {
+                                    matches!(
+                                        v,
+                                        api::ItemSortBy::SortName
+                                            | api::ItemSortBy::Name
+                                    )
+                                })
                     })
                     .unwrap_or(true);
                 if is_client_default {
@@ -206,16 +229,14 @@ pub async fn get_items(
         }
     }
 
-    let server_config = db::Settings::get_config(
+    let server_config = db::Settings::get_config_or_default(
         &state
             .ctx
             .db,
     )
-    .await
-    .ok();
+    .await;
     let show_ungrouped = server_config
-        .as_ref()
-        .and_then(|c| c.stream_groups_show_ungrouped)
+        .stream_groups_show_ungrouped
         .unwrap_or(true);
 
     let search = q
@@ -242,9 +263,7 @@ pub async fn get_items(
             .include_item_types
             .as_deref()
             .unwrap_or(&[]);
-        let cfg = server_config
-            .clone()
-            .unwrap_or_default();
+        let cfg = server_config.clone();
 
         if let Some(ref s) = search {
             let limit = q
@@ -367,7 +386,7 @@ pub async fn get_items(
                     &local_q,
                     false,
                     Some(&session.user),
-                    server_config.as_ref(),
+                    Some(&server_config),
                     None,
                     None,
                 )
@@ -527,7 +546,7 @@ pub async fn get_items(
                     &q,
                     true,
                     Some(&session.user),
-                    server_config.as_ref(),
+                    Some(&server_config),
                     None,
                     Some(&parent),
                 )
@@ -549,6 +568,9 @@ pub async fn get_items(
                 match kind {
                     db::CollectionMediaKind::Movie => vec![db::MediaKind::Movie],
                     db::CollectionMediaKind::Series => vec![db::MediaKind::Series],
+                    db::CollectionMediaKind::Mixed => {
+                        vec![db::MediaKind::Movie, db::MediaKind::Series]
+                    }
                     db::CollectionMediaKind::Music => vec![
                         db::MediaKind::Track,
                         db::MediaKind::Album,
@@ -584,7 +606,7 @@ pub async fn get_items(
                         .cloned()
                         .collect();
                     if intersection.is_empty() {
-                        collection_types
+                        vec![]
                     } else {
                         intersection
                     }
@@ -621,9 +643,10 @@ pub async fn get_items(
                     .ctx
                     .db,
                 &q,
-                true,
+                q.enable_total_record_count
+                    .unwrap_or(true),
                 Some(&session.user),
-                server_config.as_ref(),
+                Some(&server_config),
                 smart_filter,
                 Some(&parent),
             )
@@ -670,7 +693,7 @@ pub async fn get_items(
         &q,
         want_total,
         Some(&session.user),
-        server_config.as_ref(),
+        Some(&server_config),
         None,
         parent.as_ref(),
     )
@@ -711,7 +734,7 @@ pub async fn get_items(
                 &q,
                 want_total,
                 Some(&session.user),
-                server_config.as_ref(),
+                Some(&server_config),
                 None,
                 parent.as_ref(),
             )
@@ -787,11 +810,14 @@ pub async fn items_flat(
                         .as_deref()
                         .map(|s| {
                             s.is_empty()
-                                || matches!(
-                                    s.first(),
-                                    Some(api::ItemSortBy::SortName)
-                                        | Some(api::ItemSortBy::Name)
-                                )
+                                || s.iter()
+                                    .any(|v| {
+                                        matches!(
+                                            v,
+                                            api::ItemSortBy::SortName
+                                                | api::ItemSortBy::Name
+                                        )
+                                    })
                         })
                         .unwrap_or(true);
                     if is_client_default {
@@ -1113,6 +1139,98 @@ pub async fn items_certifications(
     Ok(Json(values))
 }
 
+/// List distinct production countries from media_relations, optionally filtered by search_term
+#[get("/items/countries")]
+pub async fn items_countries(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    Query(q): Query<api::GetItemsQuery>,
+) -> Result<impl IntoResponse> {
+    let values: Vec<String> = match q
+        .search_term
+        .as_deref()
+    {
+        Some(s) if !s.is_empty() => {
+            let pattern = format!("%{}%", s.to_lowercase());
+            sqlx::query(
+                "SELECT DISTINCT title FROM media \
+                 WHERE kind = 'country' AND lower(title) LIKE ? \
+                 ORDER BY title LIMIT 25",
+            )
+            .bind(&pattern)
+            .fetch_all(&state.ctx.db)
+            .await?
+            .iter()
+            .map(|r| {
+                use sqlx::Row;
+                r.get::<String, _>(0)
+            })
+            .collect()
+        }
+        _ => sqlx::query(
+            "SELECT DISTINCT title FROM media WHERE kind = 'country' ORDER BY title LIMIT 50",
+        )
+        .fetch_all(&state.ctx.db)
+        .await?
+        .iter()
+        .map(|r| {
+            use sqlx::Row;
+            r.get::<String, _>(0)
+        })
+        .collect(),
+    };
+    Ok(Json(values))
+}
+
+/// List distinct original_language codes from media, optionally filtered by search_term
+#[get("/items/languages")]
+pub async fn items_languages(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    Query(q): Query<api::GetItemsQuery>,
+) -> Result<impl IntoResponse> {
+    let values: Vec<String> = match q
+        .search_term
+        .as_deref()
+    {
+        Some(s) if !s.is_empty() => {
+            let pattern = format!("%{}%", s.to_lowercase());
+            sqlx::query(
+                "SELECT DISTINCT original_language FROM media \
+                 WHERE original_language IS NOT NULL AND lower(original_language) LIKE ? \
+                 ORDER BY original_language LIMIT 25",
+            )
+            .bind(&pattern)
+            .fetch_all(&state.ctx.db)
+            .await?
+            .iter()
+            .map(|r| {
+                use sqlx::Row;
+                r.get::<String, _>(0)
+            })
+            .collect()
+        }
+        _ => sqlx::query(
+            "SELECT DISTINCT original_language FROM media \
+             WHERE original_language IS NOT NULL \
+             ORDER BY original_language LIMIT 50",
+        )
+        .fetch_all(
+            &state
+                .ctx
+                .db,
+        )
+        .await?
+        .iter()
+        .map(|r| {
+            use sqlx::Row;
+            r.get::<String, _>(0)
+        })
+        .collect(),
+    };
+    Ok(Json(values))
+}
+
 /// Trigger a full library refresh (re-imports all enabled catalogs)
 #[post("/library/refresh")]
 pub async fn library_refresh(
@@ -1181,13 +1299,14 @@ pub async fn items_theme_songs(
 
 #[get("/items/{id}/intros")]
 pub async fn items_intros(
-    _state: State<AppState>,
-    _session: auth::AuthSession,
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
-    Ok(Json(api::BaseItemDtoQueryResult::default()))
+    crate::api::intro::get_intros_inner(state, session, id).await
 }
 
-#[api_query]
+#[query]
 #[derive(Debug, Default)]
 pub struct RemoteImagesQuery {
     #[serde(rename = "type", alias = "Type")]
@@ -1398,43 +1517,38 @@ pub async fn item(
     let want_streams = fields
         .map(|f| f.contains(&api::ItemFields::MediaSources))
         .unwrap_or(true);
-    let server_config = db::Settings::get_config(
+    let server_config = db::Settings::get_config_or_default(
         &state
             .ctx
             .db,
     )
-    .await
-    .ok();
+    .await;
     let show_ungrouped = server_config
-        .as_ref()
-        .and_then(|c| c.stream_groups_show_ungrouped)
+        .stream_groups_show_ungrouped
         .unwrap_or(true);
-    let mut media = match db::Media::get_by_filter(
-        &state
-            .ctx
-            .db,
-        &db::MediaFilter {
-            id: Some(vec![id]),
-            include_user_state: true,
-            include_child_count: true,
-            user_id: Some(
-                session
-                    .user
-                    .id,
-            ),
-            ..Default::default()
-        },
-    )
-    .await?
-    .records
-    .into_iter()
-    .next()
-    {
-        Some(m) => m,
-        None => match MediaResolveService::resolve_item(id, &state.ctx).await? {
-            Some(m) => m,
-            None => return Ok(None),
-        },
+    let mut media = match MediaResolveService::resolve_item(id, &state.ctx).await? {
+        Some(m) => db::Media::get_by_filter(
+            &state
+                .ctx
+                .db,
+            &db::MediaFilter {
+                id: Some(vec![m.id]),
+                include_user_state: true,
+                include_child_count: true,
+                user_id: Some(
+                    session
+                        .user
+                        .id,
+                ),
+                ..Default::default()
+            },
+        )
+        .await?
+        .records
+        .into_iter()
+        .next()
+        .unwrap_or(m),
+        None => return Ok(None),
     };
 
     let needs_streams = want_streams
@@ -1468,9 +1582,11 @@ pub async fn item(
                 .is_empty()
         })
         .cloned();
-    if media.kind == db::MediaKind::Stream {
+    if want_streams && media.kind == db::MediaKind::Stream {
         media.sources = Some(vec![media.clone()]);
-    } else if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
+    } else if want_streams
+        && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+    {
         let raw = media
             .streams(
                 &state
@@ -1500,7 +1616,7 @@ pub async fn item(
                 &session.user,
             )
             .await?;
-    } else if media.kind == db::MediaKind::Track {
+    } else if want_streams && media.kind == db::MediaKind::Track {
         let raw = media
             .streams(
                 &state
@@ -1655,10 +1771,11 @@ pub async fn item(
             }
         }
     }
-    if media
-        .sources
-        .as_ref()
-        .is_none_or(|s| s.is_empty())
+    if want_streams
+        && media
+            .sources
+            .as_ref()
+            .is_none_or(|s| s.is_empty())
         && !matches!(
             media.kind,
             db::MediaKind::TvChannel | db::MediaKind::TvProgram
@@ -1667,37 +1784,6 @@ pub async fn item(
         base_item.location_type = api::LocationType::Virtual;
         base_item.path = None;
         base_item.can_download = Some(false);
-    }
-
-    //let enable_subtitles_detail = crate::db::Settings::get_config(&state.ctx.db)
-    //    .await
-    //    .ok()
-    //    .and_then(|c| c.enable_subtitles_detail)
-    //    .unwrap_or(true);
-    let enable_subtitles_detail = true;
-    if enable_subtitles_detail {
-        if let Some(ref mut sources) = base_item.media_sources {
-            if !sources.is_empty() {
-                let sub_langs = server_config
-                    .as_ref()
-                    .and_then(|c| {
-                        c.subtitle_languages
-                            .clone()
-                    })
-                    .unwrap_or_default();
-                super::playback::inject_external_subtitles(
-                    &state.ctx,
-                    &media,
-                    sources,
-                    media.id,
-                    &session
-                        .device
-                        .access_token,
-                    sub_langs,
-                )
-                .await;
-            }
-        }
     }
 
     apply_permissions(&mut base_item, &session.user);
@@ -1872,7 +1958,7 @@ fn media_to_virtual_folder(m: db::Media) -> api::VirtualFolderInfo {
     let collection_type = m
         .collection_media_kind
         .clone()
-        .map(api::db_media_kind_to_collection_type);
+        .and_then(api::db_media_kind_to_collection_type);
     api::VirtualFolderInfo {
         name: Some(
             m.title
@@ -1927,7 +2013,7 @@ pub async fn create_virtual_folder(
         collection_kind: Some(collection_kind.clone()),
         collection_media_kind,
         promoted,
-        idx: payload.sort_order,
+        sort_order: payload.sort_order,
         ..Default::default()
     };
 
@@ -1990,7 +2076,7 @@ pub async fn update_virtual_folder(
     let updated_at = Utc::now().naive_utc();
 
     sqlx::query(
-        "UPDATE media SET title = $1, promoted = $2, collection_media_kind = $3, collection_kind = $4, collection_max_items = $5, updated_at = $6, idx = $8 WHERE id = $7",
+        "UPDATE media SET title = $1, promoted = $2, collection_media_kind = $3, collection_kind = $4, collection_max_items = $5, updated_at = $6, sort_order = $8 WHERE id = $7",
     )
     .bind(&payload.name)
     .bind(promoted)
@@ -2020,7 +2106,7 @@ pub async fn update_virtual_folder(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[api_query]
+#[query]
 #[derive(Debug)]
 struct DeleteVirtualFolderQuery {
     name: String,
@@ -2063,6 +2149,7 @@ fn parse_collection_type(s: &str) -> Option<db::CollectionMediaKind> {
     match s {
         "movies" => Some(db::CollectionMediaKind::Movie),
         "tvshows" => Some(db::CollectionMediaKind::Series),
+        "mixed" => Some(db::CollectionMediaKind::Mixed),
         "music" => Some(db::CollectionMediaKind::Music),
         "collections" => Some(db::CollectionMediaKind::Collection),
         "playlists" => Some(db::CollectionMediaKind::Playlist),
@@ -2112,6 +2199,11 @@ pub async fn genres(
                 Some(db::CollectionMediaKind::Series) => {
                     vec![db::MediaKind::Series, db::MediaKind::Episode]
                 }
+                Some(db::CollectionMediaKind::Mixed) => vec![
+                    db::MediaKind::Movie,
+                    db::MediaKind::Series,
+                    db::MediaKind::Episode,
+                ],
                 _ => vec![
                     db::MediaKind::Movie,
                     db::MediaKind::Series,
@@ -2226,7 +2318,7 @@ pub async fn items_metadata_editor(
     Ok(Json(api::MetadataEditorInfo::default()))
 }
 
-#[api_query]
+#[query]
 #[derive(Debug, Default)]
 struct GetSimilarItemsQuery {
     pub user_id: Option<Uuid>,
@@ -2494,7 +2586,7 @@ fn warm_providers_cache(ctx: &crate::AppContext, media: &db::Media) {
     });
 }
 
-#[api_query]
+#[query]
 #[derive(Default)]
 pub struct SegmentQuery {
     #[serde(rename = "includeSegmentTypes", default)]
@@ -2577,4 +2669,240 @@ pub async fn media_segments(
         "TotalRecordCount": count,
         "StartIndex": 0,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use http::header::HeaderValue;
+    use uuid::Uuid;
+
+    use crate::{
+        db,
+        db::{ExternalIds, MediaIdRaw, NonEmptyString},
+        integration_test::{auth_header_with_token, authenticated_server},
+    };
+
+    fn make_content_ids(kind: db::MediaKind, imdb: &str) -> (Uuid, ExternalIds) {
+        let ext = ExternalIds {
+            imdb: Some(NonEmptyString::try_new(imdb.to_string()).unwrap()),
+            ..Default::default()
+        };
+        let id = Uuid::from(&MediaIdRaw {
+            kind: kind.clone(),
+            external_ids: ext.clone(),
+            season: None,
+            episode: None,
+        });
+        (id, ext)
+    }
+
+    async fn insert_media(
+        db: &sqlx::SqlitePool,
+        title: &str,
+        kind: db::MediaKind,
+        imdb: &str,
+    ) -> db::Media {
+        let now = Utc::now().naive_utc();
+        let (id, ext) = make_content_ids(kind.clone(), imdb);
+        let mut m = db::Media {
+            id,
+            title: title.to_string(),
+            kind,
+            external_ids: ext,
+            created_at: now,
+            updated_at: now,
+            released_at: Some(now - chrono::Duration::days(365)),
+            ..Default::default()
+        };
+        m.save(db)
+            .await
+            .expect("insert_media failed");
+        m
+    }
+
+    async fn insert_smart_collection(
+        db: &sqlx::SqlitePool,
+        title: &str,
+        media_kind: db::CollectionMediaKind,
+    ) -> db::Media {
+        let now = Utc::now().naive_utc();
+        let mut c = db::Media {
+            title: title.to_string(),
+            kind: db::MediaKind::Collection,
+            collection_kind: Some(db::CollectionKind::Smart),
+            collection_media_kind: Some(media_kind),
+            created_at: now,
+            updated_at: now,
+            ..Default::default()
+        };
+        c.save(db)
+            .await
+            .expect("insert_smart_collection failed");
+        c
+    }
+
+    // Requests movies from a series-only smart collection; must return nothing.
+    #[tokio::test]
+    async fn test_include_item_types_mismatched_returns_empty() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let collection =
+            insert_smart_collection(db, "Shows", db::CollectionMediaKind::Series).await;
+        insert_media(db, "Breaking Bad", db::MediaKind::Series, "tt0903747").await;
+        insert_media(db, "Inception", db::MediaKind::Movie, "tt1375666").await;
+
+        let user: serde_json::Value = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let user_id = user["Id"]
+            .as_str()
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/users/{}/items", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    collection
+                        .id
+                        .to_string()
+                        .as_str(),
+                ),
+                ("includeItemTypes", "Movie"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["TotalRecordCount"], 0,
+            "movie query on series collection must be empty"
+        );
+        assert_eq!(
+            body["Items"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    // Requests series from a series-only smart collection; must return the series.
+    #[tokio::test]
+    async fn test_include_item_types_matching_returns_items() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let collection =
+            insert_smart_collection(db, "Shows", db::CollectionMediaKind::Series).await;
+        insert_media(db, "Breaking Bad", db::MediaKind::Series, "tt0903747").await;
+
+        let user: serde_json::Value = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let user_id = user["Id"]
+            .as_str()
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/users/{}/items", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[
+                (
+                    "parentId",
+                    collection
+                        .id
+                        .to_string()
+                        .as_str(),
+                ),
+                ("includeItemTypes", "Series"),
+            ])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0)
+                > 0,
+            "series query on series collection must return items"
+        );
+    }
+
+    // No includeItemTypes filter on a series collection should still return series.
+    #[tokio::test]
+    async fn test_no_include_item_types_returns_collection_default() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+
+        let collection =
+            insert_smart_collection(db, "Shows", db::CollectionMediaKind::Series).await;
+        insert_media(db, "The Wire", db::MediaKind::Series, "tt0306414").await;
+
+        let user: serde_json::Value = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json();
+        let user_id = user["Id"]
+            .as_str()
+            .unwrap();
+
+        let resp = server
+            .get(&format!("/users/{}/items", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .add_query_params(&[(
+                "parentId",
+                collection
+                    .id
+                    .to_string()
+                    .as_str(),
+            )])
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(
+            body["TotalRecordCount"]
+                .as_i64()
+                .unwrap_or(0)
+                > 0,
+            "unfiltered query on series collection must return series"
+        );
+    }
 }

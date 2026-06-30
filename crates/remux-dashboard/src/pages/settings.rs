@@ -4,9 +4,11 @@ use crate::{
 };
 use dioxus::prelude::*;
 use remux_sdks::remux::{
-    CountryInfo, EncodingOptions, GetCountries, GetEncodingConfiguration,
-    GetSystemConfiguration, HardwareAccelerationType, ServerConfiguration, StartTask,
-    UpdateEncodingConfiguration, UpdateSystemConfiguration,
+    CountryInfo, EmbeddedSubtitleHandling, EncodingOptions, GetCountries,
+    GetEncodingConfiguration, GetIntroConfiguration, GetSystemConfiguration,
+    HardwareAccelerationType, IntroOptions, IntroOrder, IntroTriggers,
+    ServerConfiguration, StartTask, UpdateEncodingConfiguration,
+    UpdateIntroConfiguration, UpdateSystemConfiguration,
 };
 
 #[component]
@@ -221,7 +223,7 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                                 " Filter by digital release date"
                             }
                             p { class: "field-hint",
-                                "Hide items that haven't been digitally released yet. Falls back to theatrical release date when no digital date is set."
+                                "Hide items that haven't been digitally released yet. Items released theatrically within the past year are always hidden when no digital date is available."
                             }
                         }
 
@@ -314,6 +316,7 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
     let mut h264_crf = use_signal(|| 23_u32);
     let mut h265_crf = use_signal(|| 28_u32);
     let mut enable_video_transcoding = use_signal(|| true);
+    let mut subtitle_mode = use_signal(|| "Burn".to_string());
     let mut loading = use_signal(|| true);
     let mut saving = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
@@ -393,6 +396,11 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
                         opts.enable_video_transcoding
                             .unwrap_or(true),
                     );
+                    subtitle_mode.set(
+                        opts.subtitle_mode
+                            .unwrap_or(EmbeddedSubtitleHandling::Burn)
+                            .to_string(),
+                    );
                 }
                 Err(e) => error.set(Some(format!("Failed to load settings: {e}"))),
             }
@@ -441,6 +449,10 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
             h264_crf: Some(*h264_crf.peek()),
             h265_crf: Some(*h265_crf.peek()),
             enable_video_transcoding: Some(*enable_video_transcoding.peek()),
+            subtitle_mode: subtitle_mode
+                .peek()
+                .parse::<EmbeddedSubtitleHandling>()
+                .ok(),
         };
         saving.set(true);
         error.set(None);
@@ -475,6 +487,21 @@ pub fn PlaybackSettingsCard(app_state: AppState) -> Element {
                                     onchange: move |e| enable_video_transcoding.set(e.checked()),
                                 }
                                 "Enable video transcoding"
+                            }
+                        }
+
+                        div { class: "field",
+                            label { class: "field-label", "Unsupported Subtitle Handling" }
+                            div { class: "field-hint",
+                                "What to do with embedded subtitle streams the client device doesn't support. Burn encodes them into the video. Extract delivers them separately via the subtitle stream endpoint (may be slow for remote sources). Strip removes them from the media source so the client never sees them — no subtitle-triggered transcoding."
+                            }
+                            select {
+                                class: "select-input",
+                                value: subtitle_mode.read().clone(),
+                                onchange: move |e| subtitle_mode.set(e.value()),
+                                option { value: "Burn", "Burn into video (default)" }
+                                option { value: "Extract", "Extract and deliver separately" }
+                                option { value: "Strip", "Strip (remove, no transcoding)" }
                             }
                         }
 
@@ -1338,6 +1365,200 @@ pub fn P2pSettingsCard(app_state: AppState) -> Element {
                         }
                     }
                 }
+        }
+    }
+}
+
+#[component]
+pub fn IntroSettingsCard(app_state: AppState) -> Element {
+    let mut intro_dir = use_signal(String::new);
+    let mut order = use_signal(|| "random".to_string());
+    let mut movies = use_signal(|| true);
+    let mut season_premieres = use_signal(|| true);
+    let mut all_episodes = use_signal(|| false);
+    let mut skip_resume = use_signal(|| true);
+    let mut loading = use_signal(|| true);
+    let mut saving = use_signal(|| false);
+    let mut error = use_signal(|| Option::<String>::None);
+    let mut saved = use_signal(|| false);
+
+    let app_state_load = app_state.clone();
+    use_effect(move || {
+        let client = app_state_load
+            .client
+            .clone();
+        spawn(async move {
+            match client
+                .execute(GetIntroConfiguration)
+                .await
+            {
+                Ok(opts) => {
+                    intro_dir.set(
+                        opts.intro_dir
+                            .unwrap_or_default(),
+                    );
+                    order.set(match opts.order {
+                        IntroOrder::Sequential => "sequential".to_string(),
+                        IntroOrder::Random => "random".to_string(),
+                    });
+                    movies.set(
+                        opts.triggers
+                            .movies,
+                    );
+                    season_premieres.set(
+                        opts.triggers
+                            .season_premieres,
+                    );
+                    all_episodes.set(
+                        opts.triggers
+                            .all_episodes,
+                    );
+                    skip_resume.set(opts.skip_resume);
+                }
+                Err(e) => {
+                    error.set(Some(format!("Failed to load intro settings: {e}")))
+                }
+            }
+            loading.set(false);
+        });
+    });
+
+    let on_submit = move |e: Event<FormData>| {
+        e.prevent_default();
+        let client = app_state
+            .client
+            .clone();
+        let dir_val = intro_dir
+            .peek()
+            .clone();
+        let opts = IntroOptions {
+            intro_dir: if dir_val
+                .trim()
+                .is_empty()
+            {
+                None
+            } else {
+                Some(dir_val)
+            },
+            order: if *order.peek() == "sequential" {
+                IntroOrder::Sequential
+            } else {
+                IntroOrder::Random
+            },
+            triggers: IntroTriggers {
+                movies: *movies.peek(),
+                season_premieres: *season_premieres.peek(),
+                all_episodes: *all_episodes.peek(),
+            },
+            skip_resume: *skip_resume.peek(),
+        };
+        saved.set(false);
+        error.set(None);
+        saving.set(true);
+        spawn(async move {
+            match client
+                .execute(UpdateIntroConfiguration { config: opts })
+                .await
+            {
+                Ok(_) => saved.set(true),
+                Err(e) => error.set(Some(e.user_message())),
+            }
+            saving.set(false);
+        });
+    };
+
+    rsx! {
+        Card { title: "Intro",
+            if *loading.read() {
+                LoadingText {}
+            } else {
+                form { onsubmit: on_submit, style: "display:flex;flex-direction:column;gap:14px",
+                    div { class: "field",
+                        label { class: "field-label", r#for: "intro-dir", "Intro Folder" }
+                        div { class: "field-hint",
+                            "Absolute path to a folder containing intro video files (mp4, mkv, mov, avi, m4v). Leave blank to disable intros."
+                        }
+                        input {
+                            id: "intro-dir",
+                            r#type: "text",
+                            class: "text-input",
+                            placeholder: "/path/to/intros",
+                            value: "{intro_dir}",
+                            oninput: move |e| intro_dir.set(e.value()),
+                        }
+                    }
+
+                    div { class: "field",
+                        label { class: "field-label", r#for: "intro-order", "Playback Order" }
+                        div { class: "field-hint", "How to pick an intro when multiple files are present." }
+                        select {
+                            id: "intro-order",
+                            class: "select-input",
+                            value: "{order}",
+                            onchange: move |e| order.set(e.value()),
+                            option { value: "random", "Random" }
+                            option { value: "sequential", "Sequential (round-robin)" }
+                        }
+                    }
+
+                    div { class: "field",
+                        label { class: "field-label", "Play Before" }
+                        div { class: "field-hint", "Which content types trigger an intro." }
+                        label { style: "display:flex;align-items:center;gap:8px;margin-bottom:6px",
+                            input {
+                                r#type: "checkbox",
+                                checked: *movies.read(),
+                                onchange: move |e| movies.set(e.checked()),
+                            }
+                            "Movies"
+                        }
+                        label { style: "display:flex;align-items:center;gap:8px;margin-bottom:6px",
+                            input {
+                                r#type: "checkbox",
+                                checked: *season_premieres.read(),
+                                onchange: move |e| season_premieres.set(e.checked()),
+                            }
+                            "Season premieres (episode 1 of each season)"
+                        }
+                        label { style: "display:flex;align-items:center;gap:8px",
+                            input {
+                                r#type: "checkbox",
+                                checked: *all_episodes.read(),
+                                onchange: move |e| all_episodes.set(e.checked()),
+                            }
+                            "All episodes"
+                        }
+                    }
+
+                    div { class: "field",
+                        label { class: "field-label", "Resume Behaviour" }
+                        label { style: "display:flex;align-items:center;gap:8px",
+                            input {
+                                r#type: "checkbox",
+                                checked: *skip_resume.read(),
+                                onchange: move |e| skip_resume.set(e.checked()),
+                            }
+                            "Skip intro when user is resuming from a saved position"
+                        }
+                    }
+
+                    if let Some(err) = error.read().as_ref() {
+                        ErrorAlert { message: err.clone() }
+                    }
+                    if *saved.read() {
+                        SuccessAlert { message: "Intro settings saved. The intro folder will be scanned in the background.".to_string() }
+                    }
+
+                    FormActions {
+                        button {
+                            r#type: "submit",
+                            class: "btn btn-primary",
+                            disabled: *saving.read(),
+                            if *saving.read() { "Saving…" } else { "Save Settings" }
+                        }
+                    }
+                }
+            }
         }
     }
 }

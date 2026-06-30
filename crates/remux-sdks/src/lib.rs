@@ -5,6 +5,7 @@ pub mod introdb;
 pub mod remux;
 pub mod stremio;
 pub mod tmdb;
+pub mod trakt;
 
 use http::{HeaderMap, HeaderValue, Method, header};
 use itertools::Itertools;
@@ -14,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use std::{collections::HashMap, fmt, iter, ops, sync::Arc, time::Duration};
 
 static HTTP_CACHE: std::sync::LazyLock<Store> =
-    std::sync::LazyLock::new(|| Store::new_weighted(64 * 1024 * 1024)); // 64 MB weight cap
+    std::sync::LazyLock::new(|| Store::new_weighted(32 * 1024 * 1024)); // 32 MB weight cap
 
 static SHARED_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(reqwest::Client::new);
@@ -79,6 +80,8 @@ impl Auth for JellyfinApiKeyAuth {
 pub enum ClientError {
     #[error("unauthorized")]
     Unauthorized,
+    #[error("rate limited, retry after {retry_after_secs}s")]
+    RateLimited { retry_after_secs: u64 },
     #[error("http error (status={status}) endpoint={endpoint:?}: {message}")]
     Http {
         status: u16,
@@ -159,12 +162,27 @@ impl Default for Body {
 
 pub trait Endpoint {
     type Output: DeserializeOwned + Clone + Serialize + Send + Sync + 'static;
+
+    fn path(&self) -> String;
+
+    fn query_params(&self) -> impl serde::Serialize + '_ {
+        ()
+    }
+
+    fn query(&self) -> Vec<(String, String)> {
+        serde_urlencoded::to_string(&self.query_params())
+            .unwrap_or_default()
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .filter_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect()
+    }
+
     fn method(&self) -> Method {
         Method::GET
-    }
-    fn path(&self) -> String;
-    fn query(&self) -> Vec<(String, String)> {
-        Vec::new()
     }
     fn headers(&self) -> HeaderMap {
         HeaderMap::new()
@@ -220,14 +238,18 @@ impl<A: Auth + Clone> RestClient<A> {
             .base
             .join(path.trim_matches('/'))
             .unwrap();
+        // query() returns already-percent-encoded key=value pairs from serde_urlencoded.
+        // Reassemble them into a raw query string and set it directly — feeding them
+        // into query_pairs_mut().extend_pairs() would double-encode the values
+        // (e.g. comma → %2C → %252C), breaking TMDB's append_to_response parameter.
         let query = endpoint.query();
         if !query.is_empty() {
-            url.query_pairs_mut()
-                .extend_pairs(
-                    query
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.as_str())),
-                );
+            let qs: String = query
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&");
+            url.set_query(Some(&qs));
         }
         let cache_key = hash_key(&url.to_string());
 
@@ -279,6 +301,21 @@ impl<A: Auth + Clone> RestClient<A> {
         let status = resp
             .status()
             .as_u16();
+        if status == 429 {
+            let retry_after_secs = resp
+                .headers()
+                .get("Retry-After")
+                .and_then(|v| {
+                    v.to_str()
+                        .ok()
+                })
+                .and_then(|s| {
+                    s.parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(60);
+            return Err(ClientError::RateLimited { retry_after_secs });
+        }
         let text = resp
             .text()
             .await

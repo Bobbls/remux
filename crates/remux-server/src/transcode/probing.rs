@@ -1,6 +1,7 @@
 use crate::{
     api,
     common::{TickUnit, ToRunTimeTicks},
+    device_profile::{AudioCodec, SubtitleCodec, VideoCodec},
 };
 use anyhow::{Result, anyhow};
 use isolang::Language;
@@ -17,6 +18,32 @@ fn nonzero<T: Default + PartialOrd>(v: T) -> Option<T> {
     if v > T::default() { Some(v) } else { None }
 }
 
+fn normalize_lang(code: &str) -> &str {
+    match code {
+        "alb" => "sqi",
+        "arm" => "hye",
+        "baq" => "eus",
+        "bur" => "mya",
+        "chi" => "zho",
+        "cze" => "ces",
+        "dut" => "nld",
+        "fre" => "fra",
+        "geo" => "kat",
+        "ger" => "deu",
+        "gre" => "ell",
+        "ice" => "isl",
+        "mac" => "mkd",
+        "mao" => "mri",
+        "may" => "msa",
+        "per" => "fas",
+        "rum" => "ron",
+        "slo" => "slk",
+        "tib" => "bod",
+        "wel" => "cym",
+        other => other,
+    }
+}
+
 fn first_to_upper(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -26,31 +53,6 @@ fn first_to_upper(s: &str) -> String {
                 .collect::<String>()
                 + c.as_str()
         }
-    }
-}
-
-fn subtitle_codec_display(codec: &str) -> &str {
-    match codec {
-        "hdmv_pgs_subtitle" => "pgssub",
-        "dvd_subtitle" => "dvdsub",
-        other => other,
-    }
-}
-
-fn audio_codec_friendly(codec: &str) -> &str {
-    match codec {
-        "aac" => "AAC",
-        "ac3" | "a52" => "Dolby Digital",
-        "eac3" => "Dolby Digital Plus",
-        "truehd" => "TrueHD",
-        "dca" | "dts" => "DTS",
-        "flac" => "FLAC",
-        "mp3" => "MP3",
-        "opus" => "Opus",
-        "vorbis" => "Vorbis",
-        "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" => "PCM",
-        "alac" => "ALAC",
-        other => other,
     }
 }
 
@@ -132,7 +134,13 @@ fn display_title_audio(m: &StreamMeta) -> Option<String> {
             );
         }
     } else if let Some(codec) = m.codec {
-        attrs.push(audio_codec_friendly(codec).to_string());
+        attrs.push(
+            codec
+                .parse::<AudioCodec>()
+                .unwrap()
+                .friendly_name()
+                .to_string(),
+        );
     }
 
     if let Some(layout) = m.channel_layout {
@@ -202,14 +210,15 @@ fn display_title_subtitle(m: &StreamMeta) -> Option<String> {
     if m.is_hearing_impaired {
         attrs.push("Hearing Impaired".into());
     }
-    if m.is_default {
-        attrs.push("Default".into());
-    }
     if m.is_forced {
         attrs.push("Forced".into());
     }
     if let Some(codec) = m.codec {
-        attrs.push(subtitle_codec_display(codec).to_ascii_uppercase());
+        let display = codec
+            .parse::<SubtitleCodec>()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|_| codec.to_string());
+        attrs.push(display.to_ascii_uppercase());
     }
     if m.is_external {
         attrs.push("External".into());
@@ -246,6 +255,8 @@ struct FfprobeDisposition {
     forced: i64,
     #[serde(default)]
     hearing_impaired: i64,
+    #[serde(default)]
+    attached_pic: i64,
 }
 
 #[derive(Deserialize)]
@@ -466,7 +477,7 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
         let language = s
             .tags
             .get("language")
-            .map(|s| s.as_str());
+            .map(|s| normalize_lang(s.as_str()));
         let title = s
             .tags
             .get("title")
@@ -474,6 +485,15 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
 
         match codec_type {
             "video" => {
+                // Skip attached pictures (embedded cover art). They are not playable
+                // video streams, and having two Type:Video entries confuses clients
+                // that look for the primary video stream.
+                if s.disposition
+                    .attached_pic
+                    != 0
+                {
+                    continue;
+                }
                 let bitrate = s
                     .bit_rate
                     .as_deref()
@@ -492,10 +512,14 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                             .as_deref()
                             .and_then(parse_frame_rate)
                     });
-                let codec = s
+                let raw_codec = s
                     .codec_name
                     .clone()
                     .unwrap_or_default();
+                let codec = raw_codec
+                    .parse::<VideoCodec>()
+                    .unwrap()
+                    .to_string();
                 let is_default = video_idx == 0;
                 let is_forced = s
                     .disposition
@@ -592,10 +616,14 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                             .ok()
                     })
                     .and_then(nonzero);
-                let codec = s
+                let raw_codec = s
                     .codec_name
                     .clone()
                     .unwrap_or_default();
+                let codec = raw_codec
+                    .parse::<AudioCodec>()
+                    .unwrap()
+                    .to_string();
                 let is_default = audio_idx == 0;
                 let is_forced = s
                     .disposition
@@ -648,18 +676,25 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
                 audio_idx += 1;
             }
             "subtitle" => {
-                let codec = s
+                let raw_codec = s
                     .codec_name
                     .clone()
                     .unwrap_or_default();
-                let is_text = matches!(
-                    codec.as_str(),
-                    "ass" | "ssa" | "subrip" | "webvtt" | "mov_text" | "text"
-                );
-                let is_image = matches!(
-                    codec.as_str(),
-                    "pgssub" | "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvdsub"
-                );
+                let parsed_codec = raw_codec
+                    .parse::<SubtitleCodec>()
+                    .ok();
+                let codec = parsed_codec
+                    .as_ref()
+                    .map(|c| c.to_string())
+                    .unwrap_or(raw_codec);
+                let is_text = parsed_codec
+                    .as_ref()
+                    .map(SubtitleCodec::is_text)
+                    .unwrap_or(false);
+                let is_image = parsed_codec
+                    .as_ref()
+                    .map(SubtitleCodec::is_image)
+                    .unwrap_or(false);
                 let delivery_method = if is_image {
                     Some(api::SubtitleDeliveryMethod::Embed)
                 } else {

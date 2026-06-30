@@ -2,8 +2,8 @@ use crate::{components::*, state::AppState};
 use dioxus::prelude::*;
 use remux_sdks::remux::{
     BaseItemDto, CollectionFilter, CreateVirtualFolder, CreateVirtualFolderPayload,
-    DeleteVirtualFolder, FilterMatchMode, FilterRule, GetItems, ItemSortBy, PatchItem,
-    PatchItemPayload, SortOrder,
+    DeleteVirtualFolder, FilterGroup, FilterMatchMode, GetItems, GetItemsQuery,
+    ItemSortBy, MediaType, PatchItem, PatchItemPayload, SortOrder,
 };
 
 /// Which collection is currently being edited (None = creating new).
@@ -40,12 +40,12 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
             .clone();
         spawn(async move {
             match client
-                .execute(GetItems {
-                    include_item_types: vec!["BoxSet".to_string()],
-                    recursive: false,
+                .execute(GetItems(GetItemsQuery {
+                    include_item_types: Some(vec![MediaType::BoxSet]),
                     sort_by: Some(vec![ItemSortBy::IndexNumber]),
                     sort_order: Some(vec![SortOrder::Ascending]),
-                })
+                    ..Default::default()
+                }))
                 .await
             {
                 Ok(result) => {
@@ -92,6 +92,7 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
                                         Some(ct) => match ct {
                                             remux_sdks::remux::CollectionType::Movies  => "Movies",
                                             remux_sdks::remux::CollectionType::Tvshows => "Shows",
+                                            remux_sdks::remux::CollectionType::Mixed   => "Mixed",
                                             remux_sdks::remux::CollectionType::Music   => "Music",
                                             remux_sdks::remux::CollectionType::Boxsets => "Collections",
                                             _ => "Unknown",
@@ -260,6 +261,29 @@ pub fn CollectionForm(
             .unwrap_or(false)
     });
     let mut col_type = use_signal(|| {
+        // Prefer the Remux namespace's CollectionMediaKind — it's the canonical source
+        // and round-trips correctly for mixed (CollectionType is omitted for mixed).
+        if let Some(mk) = existing
+            .as_ref()
+            .and_then(|f| {
+                f.remux
+                    .as_ref()
+            })
+            .and_then(|r| {
+                r.collection_media_kind
+                    .as_ref()
+            })
+        {
+            return match mk {
+                remux_sdks::remux::MediaKind::Movie => "movies".to_string(),
+                remux_sdks::remux::MediaKind::Series => "tvshows".to_string(),
+                remux_sdks::remux::MediaKind::Mixed => "mixed".to_string(),
+                remux_sdks::remux::MediaKind::Track => "music".to_string(),
+                remux_sdks::remux::MediaKind::Collection => "collections".to_string(),
+                _ => "movies".to_string(),
+            };
+        }
+        // Fallback: infer from CollectionType (covers non-remux legacy items)
         existing
             .as_ref()
             .and_then(|f| {
@@ -307,7 +331,7 @@ pub fn CollectionForm(
             })
             .unwrap_or(FilterMatchMode::All)
     });
-    let sf_rules: Signal<Vec<FilterRule>> = use_signal(|| {
+    let sf_groups: Signal<Vec<FilterGroup>> = use_signal(|| {
         existing
             .as_ref()
             .and_then(|f| {
@@ -319,10 +343,10 @@ pub fn CollectionForm(
                     .as_ref()
             })
             .map(|sf| {
-                sf.rules
+                sf.groups
                     .clone()
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| vec![FilterGroup::default()])
     });
     let tags: Signal<Vec<String>> = use_signal(|| {
         existing
@@ -382,7 +406,7 @@ pub fn CollectionForm(
             })
             .and_then(|v| v.first())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| "Ascending".to_string())
+            .unwrap_or_else(|| "Descending".to_string())
     });
     let mut saving = use_signal(|| false);
     let mut err = use_signal(|| Option::<String>::None);
@@ -456,7 +480,7 @@ pub fn CollectionForm(
                 match_mode: sf_match
                     .peek()
                     .clone(),
-                rules: sf_rules
+                groups: sf_groups
                     .peek()
                     .clone(),
             })
@@ -494,6 +518,7 @@ pub fn CollectionForm(
             .clone();
         spawn(async move {
             let result = if let Some(id) = item_id {
+                // Edit existing collection
                 let patch = client
                     .execute(PatchItem {
                         item_id: id.clone(),
@@ -527,7 +552,8 @@ pub fn CollectionForm(
                 }
                 patch
             } else {
-                client
+                // Create new collection, then patch extra fields the create endpoint doesn't accept
+                let info = match client
                     .execute(CreateVirtualFolder {
                         payload: CreateVirtualFolderPayload {
                             name,
@@ -538,7 +564,45 @@ pub fn CollectionForm(
                         },
                     })
                     .await
-                    .map(|_| ())
+                {
+                    Ok(info) => info,
+                    Err(e) => return err.set(Some(e.user_message())),
+                };
+                let Some(new_id) = info.item_id else {
+                    return on_done.call(());
+                };
+                let patch = client
+                    .execute(PatchItem {
+                        item_id: new_id.clone(),
+                        payload: PatchItemPayload {
+                            name: None,
+                            collection_type: None,
+                            collection_kind: None,
+                            smart_filter: smart_filter_payload,
+                            promoted: None,
+                            tags: Some(current_tags),
+                            sort_order: None,
+                            latest_auto_unplayed: Some(auto_unplayed),
+                            latest_sort_digital: Some(sort_digital),
+                            collection_default_sort: default_sort_payload,
+                            collection_default_sort_order: default_sort_order_payload,
+                        },
+                    })
+                    .await;
+                if patch.is_ok() {
+                    if let Some(bytes) = pending_bytes {
+                        let ct = crate::state::detect_image_content_type(&bytes);
+                        let _ = client
+                            .execute(remux_sdks::remux::UploadItemImage {
+                                item_id: new_id,
+                                image_type: "Primary".to_string(),
+                                bytes,
+                                content_type: ct,
+                            })
+                            .await;
+                    }
+                }
+                patch
             };
             match result {
                 Ok(_) => on_done.call(()),
@@ -580,6 +644,7 @@ pub fn CollectionForm(
                     onchange: move |e| col_type.set(e.value()),
                     option { value: "movies",      "Movies"      }
                     option { value: "tvshows",     "TV Shows"    }
+                    option { value: "mixed",       "Mixed (Movies & Shows)" }
                     option { value: "music",       "Music"       }
                     option { value: "collections", "Collections" }
                 }
@@ -705,7 +770,7 @@ pub fn CollectionForm(
             }
 
             if (col_kind.read().as_str() == "smart" || col_kind.read().as_str() == "catalog") && col_type.read().as_str() != "collections" {
-                FilterRuleEditor { match_mode: sf_match, rules: sf_rules }
+                FilterRuleEditor { match_mode: sf_match, groups: sf_groups }
 
                 div { class: "field",
                     label { class: "field-label", "Default Sort Override" }
@@ -717,7 +782,7 @@ pub fn CollectionForm(
                             value: "{default_sort}",
                             onchange: move |e| default_sort.set(e.value()),
                             option { value: "", selected: default_sort.read().is_empty(), "— None —" }
-                            if sf_rules.read().iter().any(|r| matches!(r, FilterRule::Catalog { .. })) {
+                            if sf_groups.read().iter().flat_map(|g| g.rules.iter()).any(|r| matches!(r, remux_sdks::remux::FilterRule::Catalog { .. })) {
                                 option { value: "CatalogOrder", selected: *default_sort.read() == "CatalogOrder", "Catalog Order" }
                             }
                             option { value: "SortName",           selected: *default_sort.read() == "SortName",           "Name" }
@@ -725,6 +790,12 @@ pub fn CollectionForm(
                             option { value: "DigitalReleaseDate", selected: *default_sort.read() == "DigitalReleaseDate", "Digital Release Date" }
                             option { value: "DateCreated",        selected: *default_sort.read() == "DateCreated",        "Date Added" }
                             option { value: "CommunityRating",    selected: *default_sort.read() == "CommunityRating",    "Community Rating" }
+                            option { value: "PopularityDay",      selected: *default_sort.read() == "PopularityDay",      "Popularity (Today)" }
+                            option { value: "PopularityWeek",     selected: *default_sort.read() == "PopularityWeek",     "Popularity (This Week)" }
+                            option { value: "PopularityMonth",    selected: *default_sort.read() == "PopularityMonth",    "Popularity (This Month)" }
+                            option { value: "PopularityAllTime",  selected: *default_sort.read() == "PopularityAllTime",  "Popularity (All Time)" }
+                            option { value: "TrendingWeek",       selected: *default_sort.read() == "TrendingWeek",       "Trending (7 days)" }
+                            option { value: "TrendingMonth",      selected: *default_sort.read() == "TrendingMonth",      "Trending (30 days)" }
                             option { value: "Random",             selected: *default_sort.read() == "Random",             "Random" }
                         }
                         if !default_sort.read().is_empty() && *default_sort.read() != "Random" {
